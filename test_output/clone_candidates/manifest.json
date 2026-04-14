@@ -1,0 +1,72 @@
+[
+  {
+    "character": "01_主公·劉邦",
+    "duration_sec": 8.2,
+    "output": "test_output/clone_candidates/01_主公·劉邦_candidate.wav"
+  },
+  {
+    "character": "03_丞相·曾國藩",
+    "duration_sec": 6.9,
+    "output": "test_output/clone_candidates/03_丞相·曾國藩_candidate.wav"
+  },
+  {
+    "character": "04_御史·魏徵",
+    "duration_sec": 7.7,
+    "output": "test_output/clone_candidates/04_御史·魏徵_candidate.wav"
+  },
+  {
+    "character": "06_戶部·范蠡",
+    "duration_sec": 7.7,
+    "output": "test_output/clone_candidates/06_戶部·范蠡_candidate.wav"
+  },
+  {
+    "character": "07_太府·管仲",
+    "duration_sec": 8.0,
+    "output": "test_output/clone_candidates/07_太府·管仲_candidate.wav"
+  },
+  {
+    "character": "08_鴻臚·蘇秦",
+    "duration_sec": 9.0,
+    "output": "test_output/clone_candidates/08_鴻臚·蘇秦_candidate.wav"
+  },
+  {
+    "character": "09_兵部·戚繼光",
+    "duration_sec": 8.6,
+    "output": "test_output/clone_candidates/09_兵部·戚繼光_candidate.wav"
+  },
+  {
+    "character": "10_刑部·狄仁傑",
+    "duration_sec": 9.0,
+    "output": "test_output/clone_candidates/10_刑部·狄仁傑_candidate.wav"
+  },
+  {
+    "character": "11_工部·李冰",
+    "duration_sec": 8.3,
+    "output": "test_output/clone_candidates/11_工部·李冰_candidate.wav"
+  },
+  {
+    "character": "13_大理·包拯",
+    "duration_sec": 7.4,
+    "output": "test_output/clone_candidates/13_大理·包拯_candidate.wav"
+  },
+  {
+    "character": "14_將軍·韓信",
+    "duration_sec": 5.6,
+    "output": "test_output/clone_candidates/14_將軍·韓信_candidate.wav"
+  },
+  {
+    "character": "15_司空·大禹",
+    "duration_sec": 9.4,
+    "output": "test_output/clone_candidates/15_司空·大禹_candidate.wav"
+  },
+  {
+    "character": "16_使君·劉備",
+    "duration_sec": 10.9,
+    "output": "test_output/clone_candidates/16_使君·劉備_candidate.wav"
+  },
+  {
+    "character": "17_司天監·李淳風",
+    "duration_sec": 8.2,
+    "output": "test_output/clone_candidates/17_司天監·李淳風_candidate.wav"
+  }
+]

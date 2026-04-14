@@ -1,6 +1,7 @@
 voice_profiles:
   主公·劉邦:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_lord_liu_bang.wav
     description: "(沉穩威嚴的中年男性，聲音渾厚有力，帶帝王氣度，語調從容自信，偶有豪邁之氣)"
     edge_voice: zh-TW-YunJheNeural
 
@@ -11,12 +12,14 @@ voice_profiles:
     edge_voice: zh-TW-YunJheNeural
 
   丞相·曾國藩:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_zeng_guofan.wav
     description: "(穩重踏實的中年男性，聲音低沉敦厚，語速平穩，帶有長者般的沉穩與威嚴)"
     edge_voice: zh-TW-YunJheNeural
 
   御史·魏徵:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_wei_zheng.wav
     description: "(剛正不阿的中年男性，聲音清朗堅定，語調鏗鏘有力，直言不諱)"
     edge_voice: zh-TW-YunJheNeural
 
@@ -27,33 +30,39 @@ voice_profiles:
     edge_voice: zh-TW-YunJheNeural
 
   戶部·范蠡:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_fan_li.wav
     description: "(精明幹練的青年男性，聲音清亮圓滑，語速稍快，帶有商人的精明與從容)"
     edge_voice: zh-TW-YunJheNeural
 
   太府·管仲:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_guan_zhong.wav
     description: "(深謀遠慮的中年男性，聲音沉穩宏亮，語調充滿自信與遠見，有大格局氣場)"
     edge_voice: zh-TW-YunJheNeural
 
   鴻臚·蘇秦:
-    mode: design
-    description: "(口才便給的青年男性，聲音清脆明亮，語速流暢，富有感染力與說服力)"
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_su_qin.wav
+    description: "(深沉內斂的青年男性，聲音低沉有磁性，語速沉穩流暢，帶有謀略家的自信與從容)"
     edge_voice: zh-TW-YunJheNeural
 
   兵部·戚繼光:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_qi_jiguang.wav
     description: "(果敢剛毅的青年男性，聲音堅實有力，語調果斷明快，帶有軍人的紀律感)"
     edge_voice: zh-TW-YunJheNeural
 
   刑部·狄仁傑:
-    mode: design
-    description: "(沉著冷靜的中年男性，聲音低沉內斂，語調審慎精準，帶有侦探般的洞察力)"
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_di_renjie.wav
+    description: "(沉著冷靜的中年男性，聲音低沉內斂，語調審慎精準，帶有偵探般的洞察力)"
     edge_voice: zh-TW-YunJheNeural
 
   工部·李冰:
-    mode: design
-    description: "(樸實堅毅的中年男性，聲音厚實穩重，語速不疾不徐，帶有工匠的踏實感)"
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_li_bing.wav
+    description: "(風流瀟灑的青年男性，聲音清朗帶笑意，語調輕快活潑，富有藝術家氣質)"
     edge_voice: zh-TW-YunJheNeural
 
   待詔·唐伯虎:
@@ -63,26 +72,31 @@ voice_profiles:
     edge_voice: zh-TW-YunJheNeural
 
   大理·包拯:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_bao_zheng.wav
     description: "(鐵面無私的中年男性，聲音渾厚莊嚴，語調嚴肅正氣，不怒自威)"
     edge_voice: zh-TW-YunJheNeural
 
   將軍·韓信:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_han_xin.wav
     description: "(英武果決的青年男性，聲音清亮銳利，語速明快果斷，帶有將帥之風)"
     edge_voice: zh-TW-YunJheNeural
 
   司空·大禹:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_da_yu.wav
     description: "(沉穩堅韌的中年男性，聲音渾厚踏實，語調沉穩如山，帶有治水者的堅毅)"
     edge_voice: zh-TW-YunJheNeural
 
   使君·劉備:
-    mode: design
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_liu_bei.wav
     description: "(溫和仁厚的青年男性，聲音柔和親切，語調真誠感人，帶有以德服人的親和力)"
     edge_voice: zh-TW-YunJheNeural
 
   司天監·李淳風:
-    mode: design
-    description: "(神秘超然的老年男性，聲音蒼老悠遠，語調緩慢而富有玄機，帶有觀星者的飄逸)"
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_li_chunfeng.wav
+    description: "(靈動活潑的青年男性，聲音清亮有朝氣，語調輕快靈巧，帶有少年天才的自信與俏皮)"
     edge_voice: zh-TW-YunJheNeural
