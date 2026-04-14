@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""王朝 VoxCPM Skill（Phase 2 原型）
+"""王朝 VoxCPM Skill（Phase 2 完整版）
 
 功能：
 - TTS Router：VoxCPM2 優先，條件不符時 fallback Edge TTS
 - Voice Profile Manager：角色音色設定讀取（YAML/JSON）
+- Style Compiler：mood / expression_tags 轉譯為 VoxCPM 控制指令
+- Audio Post-processing：ambience_profile 後處理（reverb/EQ）
 - 輸出取樣率以 model.tts_model.sample_rate 為準（禁止硬編碼）
 """
 
@@ -17,6 +19,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import soundfile as sf
+
+# 同目錄模組
+import sys as _sys
+_wangdom_dir = str(Path(__file__).parent)
+if _wangdom_dir not in _sys.path:
+    _sys.path.insert(0, _wangdom_dir)
+
+from style_compiler import compile_text
+from audio_post import post_process
 
 
 @dataclass
@@ -102,14 +113,32 @@ class VoxCpmSkill:
         character: str,
         output_path: str | Path,
         force_engine: Optional[str] = None,
+        mood: Optional[str] = None,
+        expression_tags: Optional[list] = None,
+        ambience_profile: str = "none",
     ) -> Dict[str, Any]:
+        """合成語音（含 style compiler + audio post）
+
+        Args:
+            text: 台詞
+            character: 角色名
+            output_path: 輸出路徑
+            force_engine: 強制引擎
+            mood: 情緒基調（如「沉穩」「莊嚴」）
+            expression_tags: 非語言標籤列表
+            ambience_profile: 環境音場（none/studio/hall/battle/rain/cave）
+        """
         profile = self.profile_manager.get(character)
         engine = self.route_engine(profile, force_engine)
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if engine == "voxcpm":
-            return self._generate_with_voxcpm(text, profile, output_path)
+            return self._generate_with_voxcpm(
+                text, profile, output_path,
+                mood=mood, expression_tags=expression_tags,
+                ambience_profile=ambience_profile,
+            )
         return self._generate_with_edge_tts(text, profile, output_path)
 
     # ---------- VoxCPM ----------
@@ -121,21 +150,30 @@ class VoxCpmSkill:
         self._model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False)
         return self._model
 
-    def _generate_with_voxcpm(self, text: str, profile: VoiceProfile, output_path: Path) -> Dict[str, Any]:
+    def _generate_with_voxcpm(
+        self,
+        text: str,
+        profile: VoiceProfile,
+        output_path: Path,
+        mood: Optional[str] = None,
+        expression_tags: Optional[list] = None,
+        ambience_profile: str = "none",
+    ) -> Dict[str, Any]:
         model = self._load_model()
 
-        kwargs: Dict[str, Any] = {"text": text, "cfg_value": 2.0, "inference_timesteps": 10}
+        # 使用 style_compiler 編譯最終文字
+        compiled_text = compile_text(
+            text=text,
+            mood=mood,
+            expression_tags=expression_tags,
+            profile_description=profile.description,
+        )
 
-        # mode routing
+        kwargs: Dict[str, Any] = {"text": compiled_text, "cfg_value": 2.0, "inference_timesteps": 10}
+
+        # clone / ultimate_clone 模式
         if profile.mode in {"clone", "ultimate_clone"} and profile.reference:
             kwargs["reference_wav_path"] = profile.reference
-            # VoxCPM Python API 無 control 參數，風格控制需編譯入 text
-            render_text = f"{profile.description}{text}" if profile.description else text
-            kwargs["text"] = render_text
-        else:
-            # design / fallback
-            render_text = f"{profile.description}{text}" if profile.description else text
-            kwargs["text"] = render_text
 
         wav = model.generate(**kwargs)
         arr = wav.cpu().numpy() if hasattr(wav, "cpu") else wav
@@ -143,7 +181,28 @@ class VoxCpmSkill:
             arr = arr.squeeze(0)
 
         sample_rate = int(model.tts_model.sample_rate)
-        sf.write(str(output_path), arr, sample_rate)
+
+        # 先存暫時 WAV（供 audio_post 處理）
+        raw_path = output_path
+        if ambience_profile != "none":
+            raw_path = output_path.with_suffix(".raw.wav")
+
+        sf.write(str(raw_path), arr, sample_rate)
+
+        # Audio post-processing
+        if ambience_profile != "none":
+            post_result = post_process(
+                raw_path, output_path,
+                ambience_profile=ambience_profile,
+                normalize=0.08,
+            )
+            # 清除暫存
+            if raw_path != output_path and raw_path.exists():
+                raw_path.unlink()
+        else:
+            if raw_path != output_path:
+                import shutil
+                shutil.move(str(raw_path), str(output_path))
 
         return {
             "ok": True,
@@ -152,7 +211,9 @@ class VoxCpmSkill:
             "mode": profile.mode,
             "sample_rate": sample_rate,
             "output_path": str(output_path),
-            "text_used": render_text,
+            "text_used": compiled_text,
+            "mood": mood,
+            "ambience": ambience_profile,
         }
 
     # ---------- Edge TTS Fallback ----------
@@ -201,13 +262,20 @@ class VoxCpmSkill:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="王朝 VoxCPM Skill（Phase 2 原型）")
+    parser = argparse.ArgumentParser(description="王朝 VoxCPM Skill（Phase 2 完整版）")
     parser.add_argument("--text", required=True, help="要合成的文字")
     parser.add_argument("--character", required=True, help="角色名稱（例如 軍師·諸葛亮）")
     parser.add_argument("--output", default="test_output/skill_out.wav", help="輸出音檔路徑")
     parser.add_argument("--profiles", default="profiles/voice_profiles.yaml", help="voice profile 檔案")
     parser.add_argument("--force-engine", choices=["voxcpm", "edge_tts"], default=None)
+    parser.add_argument("--mood", default=None, help="情緒基調（如 沉穩/莊嚴/歡快）")
+    parser.add_argument("--expression-tags", default=None, help="非語言標籤（逗號分隔）")
+    parser.add_argument("--ambience", default="none",
+                       choices=["none", "studio", "hall", "battle", "rain", "cave"],
+                       help="環境音場設定")
     args = parser.parse_args()
+
+    tags = args.expression_tags.split(",") if args.expression_tags else None
 
     skill = VoxCpmSkill(profiles_path=args.profiles)
     result = skill.synthesize(
@@ -215,6 +283,9 @@ def main() -> None:
         character=args.character,
         output_path=args.output,
         force_engine=args.force_engine,
+        mood=args.mood,
+        expression_tags=tags,
+        ambience_profile=args.ambience,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
