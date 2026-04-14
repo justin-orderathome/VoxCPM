@@ -106,6 +106,9 @@ class VoxCpmSkill:
             return force_engine
         if profile.mode == "edge_tts":
             return "edge_tts"
+        # 模型已載入 → 不再檢查 VRAM（避免模型自己佔 VRAM 把自己擋掉）
+        if self._model is not None:
+            return "voxcpm"
         if not self._gpu_vram_sufficient(self.min_free_gb):
             return "edge_tts"
         return "voxcpm"

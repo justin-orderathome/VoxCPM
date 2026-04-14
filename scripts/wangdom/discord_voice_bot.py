@@ -172,7 +172,7 @@ def _get_skill() -> VoxCpmSkill:
     global _skill
     if _skill is None:
         print("⏳ 載入 VoxCPM 模型（首次需 ~22s）...")
-        _skill = VoxCpmSkill(profiles_path=str(PROFILES_PATH))
+        _skill = VoxCpmSkill(profiles_path=str(PROFILES_PATH), min_free_gb=2.0)
         print("✅ VoxCPM 模型已載入")
     return _skill
 
