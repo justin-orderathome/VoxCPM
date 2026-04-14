@@ -129,9 +129,9 @@ class VoxCpmSkill:
         # mode routing
         if profile.mode in {"clone", "ultimate_clone"} and profile.reference:
             kwargs["reference_wav_path"] = profile.reference
-            if profile.description:
-                kwargs["control"] = profile.description
-            render_text = text
+            # VoxCPM Python API 無 control 參數，風格控制需編譯入 text
+            render_text = f"{profile.description}{text}" if profile.description else text
+            kwargs["text"] = render_text
         else:
             # design / fallback
             render_text = f"{profile.description}{text}" if profile.description else text
