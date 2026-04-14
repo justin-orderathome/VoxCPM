@@ -5,3 +5,11 @@ voxcpm.egg-info
 ./pretrained_models/
 app_local.py
 venv/
+
+# 王朝語音暫存輸出（二進位音檔不進 Git）
+test_output/**/*.wav
+test_output/**/*.mp3
+test_output/**/*.ogg
+
+# 但保留 manifest.json
+!test_output/**/manifest.json

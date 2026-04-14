@@ -7,6 +7,7 @@
 - Style Compiler：mood / expression_tags 轉譯為 VoxCPM 控制指令
 - Audio Post-processing：ambience_profile 後處理（reverb/EQ）
 - 輸出取樣率以 model.tts_model.sample_rate 為準（禁止硬編碼）
+- 預設輸出 MP3（128kbps），自動 ffmpeg 轉檔，中間 WAV 自動清除
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -116,6 +119,7 @@ class VoxCpmSkill:
         mood: Optional[str] = None,
         expression_tags: Optional[list] = None,
         ambience_profile: str = "none",
+        output_format: str = "mp3",
     ) -> Dict[str, Any]:
         """合成語音（含 style compiler + audio post）
 
@@ -127,6 +131,7 @@ class VoxCpmSkill:
             mood: 情緒基調（如「沉穩」「莊嚴」）
             expression_tags: 非語言標籤列表
             ambience_profile: 環境音場（none/studio/hall/battle/rain/cave）
+            output_format: 輸出格式（mp3/wav），預設 mp3
         """
         profile = self.profile_manager.get(character)
         engine = self.route_engine(profile, force_engine)
@@ -134,12 +139,28 @@ class VoxCpmSkill:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if engine == "voxcpm":
-            return self._generate_with_voxcpm(
+            result = self._generate_with_voxcpm(
                 text, profile, output_path,
                 mood=mood, expression_tags=expression_tags,
                 ambience_profile=ambience_profile,
             )
-        return self._generate_with_edge_tts(text, profile, output_path)
+        else:
+            result = self._generate_with_edge_tts(text, profile, output_path)
+
+        # MP3 預設輸出：WAV → MP3 轉檔
+        if output_format == "mp3" and result.get("ok") and Path(result["output_path"]).suffix.lower() == ".wav":
+            wav_path = Path(result["output_path"])
+            mp3_path = wav_path.with_suffix(".mp3")
+            try:
+                self._wav_to_mp3(wav_path, mp3_path)
+                result["output_path"] = str(mp3_path)
+                result["format"] = "mp3"
+            except RuntimeError as e:
+                # ffmpeg 失敗時保留 WAV，不中斷流程
+                result["format"] = "wav"
+                result["mp3_error"] = str(e)
+
+        return result
 
     # ---------- VoxCPM ----------
     def _load_model(self):
@@ -246,6 +267,23 @@ class VoxCpmSkill:
             "output_path": str(output_path),
         }
 
+    # ---------- MP3 轉檔 ----------
+    @staticmethod
+    def _wav_to_mp3(wav_path: Path, mp3_path: Path, bitrate: str = "128k") -> Path:
+        """ffmpeg WAV → MP3 轉檔。成功後刪除中間 WAV。"""
+        cmd = [
+            "ffmpeg", "-y", "-i", str(wav_path),
+            "-codec:a", "libmp3lame", "-b:a", bitrate,
+            str(mp3_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[:500]}")
+        # 刪除中間 WAV
+        if wav_path.exists() and wav_path != mp3_path:
+            wav_path.unlink()
+        return mp3_path
+
     # ---------- Health ----------
     @staticmethod
     def _gpu_vram_sufficient(min_free_gb: float) -> bool:
@@ -265,7 +303,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="王朝 VoxCPM Skill（Phase 2 完整版）")
     parser.add_argument("--text", required=True, help="要合成的文字")
     parser.add_argument("--character", required=True, help="角色名稱（例如 軍師·諸葛亮）")
-    parser.add_argument("--output", default="test_output/skill_out.wav", help="輸出音檔路徑")
+    parser.add_argument("--output", default="test_output/skill_out.mp3", help="輸出音檔路徑")
     parser.add_argument("--profiles", default="profiles/voice_profiles.yaml", help="voice profile 檔案")
     parser.add_argument("--force-engine", choices=["voxcpm", "edge_tts"], default=None)
     parser.add_argument("--mood", default=None, help="情緒基調（如 沉穩/莊嚴/歡快）")
@@ -273,6 +311,8 @@ def main() -> None:
     parser.add_argument("--ambience", default="none",
                        choices=["none", "studio", "hall", "battle", "rain", "cave"],
                        help="環境音場設定")
+    parser.add_argument("--format", choices=["mp3", "wav"], default="mp3",
+                       help="輸出格式（預設 mp3）")
     args = parser.parse_args()
 
     tags = args.expression_tags.split(",") if args.expression_tags else None
@@ -286,6 +326,7 @@ def main() -> None:
         mood=args.mood,
         expression_tags=tags,
         ambience_profile=args.ambience,
+        output_format=args.format,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
