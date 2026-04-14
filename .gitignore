@@ -12,4 +12,4 @@ test_output/**/*.mp3
 test_output/**/*.ogg
 
 # 但保留 manifest.json
-!test_output/**/manifest.json
+!test_output/**/manifest.json.env

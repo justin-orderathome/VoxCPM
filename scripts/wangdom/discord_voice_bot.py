@@ -39,6 +39,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+# 從專案根目錄 .env 載入環境變數
+from dotenv import load_dotenv
+_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_PROJECT_DIR / ".env")
+
 import discord
 from discord import FFmpegPCMAudio, VoiceClient, TextChannel
 from discord.ext import commands
