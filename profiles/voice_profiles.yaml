@@ -1,0 +1,26 @@
+voice_profiles:
+  主公·劉邦:
+    mode: clone
+    reference: test_output/voice_profiles/clone_refs/ref_1.wav
+    description: "沉穩威嚴，中年男性，語調從容自信"
+    edge_voice: zh-TW-YunJheNeural
+
+  軍師·諸葛亮:
+    mode: design
+    description: "(儒雅清朗的青年男性，書卷氣，語調沉穩內斂)"
+    edge_voice: zh-TW-YunJheNeural
+
+  丞相·曾國藩:
+    mode: design
+    description: "(穩重踏實的中年男性，低沉敦厚，語速平穩)"
+    edge_voice: zh-TW-YunJheNeural
+
+  御史·魏徵:
+    mode: design
+    description: "(剛正不阿的中年男性，清朗堅定，語調鏗鏘)"
+    edge_voice: zh-TW-YunJheNeural
+
+  禮部·紀曉嵐:
+    mode: design
+    description: "(溫文爾雅的青年男性，聲音清澈，語氣親和)"
+    edge_voice: zh-TW-YunJheNeural

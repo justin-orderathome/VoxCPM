@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""王朝 VoxCPM Skill（Phase 2 原型）
+
+功能：
+- TTS Router：VoxCPM2 優先，條件不符時 fallback Edge TTS
+- Voice Profile Manager：角色音色設定讀取（YAML/JSON）
+- 輸出取樣率以 model.tts_model.sample_rate 為準（禁止硬編碼）
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+import soundfile as sf
+
+
+@dataclass
+class VoiceProfile:
+    name: str
+    mode: str = "design"  # design | clone | ultimate_clone | edge_tts
+    description: str = ""
+    reference: Optional[str] = None
+    edge_voice: Optional[str] = None
+
+
+class VoiceProfileManager:
+    def __init__(self, profiles_path: str | Path):
+        self.profiles_path = Path(profiles_path)
+        self._profiles: Dict[str, VoiceProfile] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        self._profiles = self._load_profiles(self.profiles_path)
+
+    def get(self, character: str) -> VoiceProfile:
+        if character in self._profiles:
+            return self._profiles[character]
+        # fallback 預設設定
+        return VoiceProfile(name=character, mode="design", description="(沉穩清晰，中性語氣)")
+
+    @staticmethod
+    def _load_profiles(path: Path) -> Dict[str, VoiceProfile]:
+        if not path.exists():
+            return {}
+        raw = path.read_text(encoding="utf-8")
+
+        data: Dict[str, Any]
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                import yaml  # type: ignore
+            except Exception as exc:
+                raise RuntimeError("讀取 YAML 需安裝 pyyaml：pip install pyyaml") from exc
+            data = yaml.safe_load(raw) or {}
+        else:
+            data = json.loads(raw)
+
+        profiles: Dict[str, VoiceProfile] = {}
+        voice_profiles = data.get("voice_profiles", data)
+        for name, cfg in voice_profiles.items():
+            if not isinstance(cfg, dict):
+                continue
+            profiles[name] = VoiceProfile(
+                name=name,
+                mode=str(cfg.get("mode", "design")),
+                description=str(cfg.get("description", "")),
+                reference=cfg.get("reference"),
+                edge_voice=cfg.get("edge_voice"),
+            )
+        return profiles
+
+
+class VoxCpmSkill:
+    def __init__(
+        self,
+        model_id: str = "openbmb/VoxCPM2",
+        profiles_path: str | Path = "profiles/voice_profiles.yaml",
+        min_free_gb: float = 4.0,
+    ) -> None:
+        self.model_id = model_id
+        self.min_free_gb = min_free_gb
+        self.profile_manager = VoiceProfileManager(profiles_path)
+        self._model = None
+
+    # ---------- Router ----------
+    def route_engine(self, profile: VoiceProfile, force_engine: Optional[str] = None) -> str:
+        if force_engine in {"voxcpm", "edge_tts"}:
+            return force_engine
+        if profile.mode == "edge_tts":
+            return "edge_tts"
+        if not self._gpu_vram_sufficient(self.min_free_gb):
+            return "edge_tts"
+        return "voxcpm"
+
+    def synthesize(
+        self,
+        text: str,
+        character: str,
+        output_path: str | Path,
+        force_engine: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        profile = self.profile_manager.get(character)
+        engine = self.route_engine(profile, force_engine)
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if engine == "voxcpm":
+            return self._generate_with_voxcpm(text, profile, output_path)
+        return self._generate_with_edge_tts(text, profile, output_path)
+
+    # ---------- VoxCPM ----------
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        from voxcpm import VoxCPM  # lazy import
+
+        self._model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False)
+        return self._model
+
+    def _generate_with_voxcpm(self, text: str, profile: VoiceProfile, output_path: Path) -> Dict[str, Any]:
+        model = self._load_model()
+
+        kwargs: Dict[str, Any] = {"text": text, "cfg_value": 2.0, "inference_timesteps": 10}
+
+        # mode routing
+        if profile.mode in {"clone", "ultimate_clone"} and profile.reference:
+            kwargs["reference_wav_path"] = profile.reference
+            if profile.description:
+                kwargs["control"] = profile.description
+            render_text = text
+        else:
+            # design / fallback
+            render_text = f"{profile.description}{text}" if profile.description else text
+            kwargs["text"] = render_text
+
+        wav = model.generate(**kwargs)
+        arr = wav.cpu().numpy() if hasattr(wav, "cpu") else wav
+        if getattr(arr, "ndim", 1) == 2:
+            arr = arr.squeeze(0)
+
+        sample_rate = int(model.tts_model.sample_rate)
+        sf.write(str(output_path), arr, sample_rate)
+
+        return {
+            "ok": True,
+            "engine": "voxcpm",
+            "character": profile.name,
+            "mode": profile.mode,
+            "sample_rate": sample_rate,
+            "output_path": str(output_path),
+            "text_used": render_text,
+        }
+
+    # ---------- Edge TTS Fallback ----------
+    def _generate_with_edge_tts(self, text: str, profile: VoiceProfile, output_path: Path) -> Dict[str, Any]:
+        voice = profile.edge_voice or "zh-TW-YunJheNeural"
+        try:
+            import edge_tts  # type: ignore
+        except Exception:
+            return {
+                "ok": False,
+                "engine": "edge_tts",
+                "character": profile.name,
+                "mode": profile.mode,
+                "output_path": str(output_path),
+                "reason": "edge_tts_not_installed",
+                "hint": "pip install edge-tts",
+            }
+
+        async def _run() -> None:
+            communicate = edge_tts.Communicate(text=text, voice=voice)
+            await communicate.save(str(output_path))
+
+        asyncio.run(_run())
+        return {
+            "ok": True,
+            "engine": "edge_tts",
+            "character": profile.name,
+            "mode": profile.mode,
+            "voice": voice,
+            "output_path": str(output_path),
+        }
+
+    # ---------- Health ----------
+    @staticmethod
+    def _gpu_vram_sufficient(min_free_gb: float) -> bool:
+        try:
+            import torch
+
+            if not torch.cuda.is_available():
+                return False
+            free_bytes, _total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            return free_gb >= min_free_gb
+        except Exception:
+            return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="王朝 VoxCPM Skill（Phase 2 原型）")
+    parser.add_argument("--text", required=True, help="要合成的文字")
+    parser.add_argument("--character", required=True, help="角色名稱（例如 軍師·諸葛亮）")
+    parser.add_argument("--output", default="test_output/skill_out.wav", help="輸出音檔路徑")
+    parser.add_argument("--profiles", default="profiles/voice_profiles.yaml", help="voice profile 檔案")
+    parser.add_argument("--force-engine", choices=["voxcpm", "edge_tts"], default=None)
+    args = parser.parse_args()
+
+    skill = VoxCpmSkill(profiles_path=args.profiles)
+    result = skill.synthesize(
+        text=args.text,
+        character=args.character,
+        output_path=args.output,
+        force_engine=args.force_engine,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
