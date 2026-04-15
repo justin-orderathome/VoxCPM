@@ -1,70 +1,64 @@
 #!/usr/bin/env python3
-"""崴勝王朝 · 獨立語音 Bot
+"""崴勝王朝 · 獨立語音 Bot（常駐模型 + 真串流）
 
 功能：
-  - 連接 Discord 語音頻道，即時播放角色語音
-  - 雙模式輸出：串流（語音頻道） / 檔案（文字頻道語音訊息）
-  - 所有語音輸出同步發送文字版（耳機沒電也不漏訊）
-  - 整合 voxcpm_skill.py（角色音色 + 情緒 + BGM 音場）
-
-指令：
-  !join              — 加入主公所在語音頻道
-  !leave             — 離開語音頻道
-  !say <角色> <台詞> — 即時生成並播放（預設串流，-f 走檔案）
-  !play <檔案>       — 播放既有音頻檔（預設串流，-f 走檔案）
-  !stop              — 停止目前播放
-  !morning           — 播放當日早朝（預設串流，-f 走檔案）
-  !greeting          — 播放節日問候（預設串流，-f 走檔案）
-  !drama <劇本>      — 多人廣播劇（預設串流，-f 走檔案）
-  !weekly            — 播放有聲週報（預設串流，-f 走檔案）
-  !mode <auto|stream|file> — 切換全域輸出模式
-  !voices            — 列出可用角色
-  !status            — 顯示 Bot 狀態
-
-環境變數：
-  VOICE_BOT_TOKEN    — Discord Bot Token（必須）
+  - Discord 語音頻道串流播放（generate_streaming 逐 chunk）
+  - 檔案模式輸出（MP3/WAV）
+  - 所有語音輸出同步發送文字版
+  - VoxCPM 模型常駐（啟動載入一次）
+  - GPU 互斥鎖：串流/檔案生成排隊，不互踩
+  - !stop 可中斷串流並回收資源
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
-import io
-import json
+import itertools
 import os
 import subprocess
 import sys
-import tempfile
+import threading
 import time
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
+import json
+
+import numpy as np
+import soundfile as sf
 
 # 從專案根目錄 .env 載入環境變數
 from dotenv import load_dotenv
+
 _PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 load_dotenv(_PROJECT_DIR / ".env")
 
 import discord
-from discord import FFmpegPCMAudio, VoiceClient, TextChannel
+from discord import app_commands
 from discord.ext import commands
+
+# 同目錄模組
+_BOT_DIR = Path(__file__).resolve().parent
+if str(_BOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_BOT_DIR))
+
+from voxcpm_skill import VoiceProfileManager
+from style_compiler import compile_text
+from audio_post import post_process
+from dialogue_parser import DialogueParser
+
 
 # ---------------------------------------------------------------------------
 # 路徑設定
 # ---------------------------------------------------------------------------
-BOT_DIR = Path(__file__).resolve().parent          # scripts/wangdom/
-PROJECT_DIR = BOT_DIR.parent.parent                 # ~/projects/VoxCPM/
+PROJECT_DIR = _PROJECT_DIR
 PROFILES_PATH = PROJECT_DIR / "profiles" / "voice_profiles.yaml"
 OUTPUT_DIR = PROJECT_DIR / "test_output" / "voice_bot"
 
-# 將 wangdom 目錄加入 path（方便 import 兄弟模組）
-if str(BOT_DIR) not in sys.path:
-    sys.path.insert(0, str(BOT_DIR))
-
-from voxcpm_skill import VoxCpmSkill, VoiceProfileManager
-
 
 # ---------------------------------------------------------------------------
-# 輸出路由器
+# 輸出路由
 # ---------------------------------------------------------------------------
 class OutputMode:
     STREAM = "stream"
@@ -73,29 +67,16 @@ class OutputMode:
 
 
 class OutputRouter:
-    """決定語音輸出走向：語音頻道串流 vs 文字頻道檔案"""
-
     def __init__(self, default_mode: str = OutputMode.AUTO):
         self.default_mode = default_mode
 
-    def resolve(
-        self,
-        ctx: commands.Context,
-        flag_file: bool = False,
-        flag_stream: bool = False,
-    ) -> str:
-        """解析最終輸出模式
-
-        優先級：-f / -s flag > 全域設定 > auto 偵測
-        """
+    def resolve(self, ctx, flag_file: bool = False, flag_stream: bool = False) -> str:
         if flag_file:
             return OutputMode.FILE
         if flag_stream:
             return OutputMode.STREAM
-
         mode = self.default_mode
         if mode == OutputMode.AUTO:
-            # 主公在語音頻道 → 串流；不在 → 檔案
             if ctx.author.voice and ctx.author.voice.channel:
                 return OutputMode.STREAM
             return OutputMode.FILE
@@ -103,85 +84,426 @@ class OutputRouter:
 
 
 # ---------------------------------------------------------------------------
-# 音頻管線工具
+# 音訊工具
 # ---------------------------------------------------------------------------
-class AudioPipeline:
-    """WAV → PCM s16le 48kHz stereo → Discord AudioSource"""
+def normalize_rms(audio: np.ndarray, target_rms: float = 0.08) -> np.ndarray:
+    rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))) if audio.size else 0.0
+    if rms < 1e-8:
+        return audio.astype(np.float32)
+    gain = min(target_rms / rms, 10.0)
+    return (audio.astype(np.float32) * gain).astype(np.float32)
 
+
+def _resample_audio(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+    if src_sr == dst_sr:
+        return audio
+    n = len(audio)
+    if n == 0:
+        return audio
+    new_n = int(round(n * dst_sr / src_sr))
+    try:
+        from scipy.signal import resample  # type: ignore
+
+        return resample(audio, new_n).astype(np.float32)
+    except Exception:
+        x_old = np.linspace(0.0, 1.0, n, endpoint=False)
+        x_new = np.linspace(0.0, 1.0, new_n, endpoint=False)
+        return np.interp(x_new, x_old, audio).astype(np.float32)
+
+
+def mono_float_to_pcm_s16le_stereo(audio: np.ndarray, sample_rate: int) -> bytes:
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if sample_rate != 48000:
+        audio = _resample_audio(audio, sample_rate, 48000)
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm = (audio * 32767.0).astype(np.int16)
+    stereo = np.column_stack([pcm, pcm])
+    return stereo.tobytes()
+
+
+def crossfade_chunks(prev: np.ndarray, curr: np.ndarray, overlap_samples: int) -> tuple[np.ndarray, np.ndarray]:
+    """回傳 (可立即輸出的塊, 需暫存等待下一塊的尾巴)。"""
+    if prev.size == 0:
+        return np.zeros(0, dtype=np.float32), curr.astype(np.float32)
+    if curr.size == 0:
+        return prev.astype(np.float32), np.zeros(0, dtype=np.float32)
+
+    o = int(max(0, min(overlap_samples, len(prev), len(curr))))
+    if o == 0:
+        return prev.astype(np.float32), curr.astype(np.float32)
+
+    out = prev.astype(np.float32).copy()
+    fade_in = np.linspace(0.0, 1.0, o, endpoint=False, dtype=np.float32)
+    fade_out = 1.0 - fade_in
+    out[-o:] = out[-o:] * fade_out + curr[:o].astype(np.float32) * fade_in
+
+    tail = curr[o:].astype(np.float32)
+    return out, tail
+
+
+class StreamAmbience:
+    """輕量即時 ambience（串流用）。"""
+
+    PRESETS = {
+        "none": (0.0, 0.0, 0),
+        "studio": (0.10, 0.15, 25),
+        "hall": (0.20, 0.30, 110),
+        "cave": (0.28, 0.36, 180),
+        "battle": (0.16, 0.22, 70),
+        "rain": (0.14, 0.18, 85),
+    }
+
+    def __init__(self, ambience: str, sample_rate: int):
+        self.ambience = ambience if ambience in self.PRESETS else "none"
+        self.sample_rate = sample_rate
+        mix, fb, delay_ms = self.PRESETS[self.ambience]
+        self.mix = float(mix)
+        self.feedback = float(fb)
+        self.delay = max(1, int(self.sample_rate * delay_ms / 1000.0))
+        self.buf = np.zeros(self.delay, dtype=np.float32)
+        self.idx = 0
+
+    def process(self, chunk: np.ndarray) -> np.ndarray:
+        x = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if self.ambience == "none" or x.size == 0:
+            return x
+        y = x.copy()
+        for i in range(len(y)):
+            d = self.buf[self.idx]
+            y[i] = np.clip(y[i] + self.mix * d, -1.0, 1.0)
+            self.buf[self.idx] = np.clip(x[i] + self.feedback * d, -1.0, 1.0)
+            self.idx += 1
+            if self.idx >= self.delay:
+                self.idx = 0
+        return y
+
+
+# ---------------------------------------------------------------------------
+# 常駐 VoxCPM 引擎
+# ---------------------------------------------------------------------------
+class VoxCpmEngine:
+    def __init__(self, profiles_path: str | Path, model_id: str = "openbmb/VoxCPM2"):
+        self.model_id = model_id
+        self.profile_manager = VoiceProfileManager(profiles_path)
+        self._model = None
+        self._gpu_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._waiting_jobs = 0
+        self._active_job: Optional[str] = None
+
+    @property
+    def model_loaded(self) -> bool:
+        return self._model is not None
+
+    @property
+    def busy(self) -> bool:
+        return self._gpu_lock.locked()
+
+    def queue_snapshot(self) -> dict:
+        with self._stats_lock:
+            return {
+                "busy": self._gpu_lock.locked(),
+                "waiting": self._waiting_jobs,
+                "active_job": self._active_job,
+            }
+
+    def _acquire_gpu(self, job_label: str):
+        with self._stats_lock:
+            self._waiting_jobs += 1
+        self._gpu_lock.acquire()
+        with self._stats_lock:
+            self._waiting_jobs = max(0, self._waiting_jobs - 1)
+            self._active_job = job_label
+
+    def _release_gpu(self):
+        with self._stats_lock:
+            self._active_job = None
+        if self._gpu_lock.locked():
+            self._gpu_lock.release()
+
+    @property
+    def out_sample_rate(self) -> int:
+        if self._model is None:
+            return 48000
+        tts = self._model.tts_model
+        return int(getattr(getattr(tts, "audio_vae", None), "out_sample_rate", getattr(tts, "sample_rate", 48000)))
+
+    def load_model(self) -> None:
+        if self._model is not None:
+            return
+        from voxcpm import VoxCPM  # lazy import
+
+        t0 = time.time()
+        # optimize=False：避免多線程串流下 CUDA graph assertion
+        self._model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False, optimize=False)
+        dt = time.time() - t0
+        print(f"✅ VoxCPM 模型已載入（{dt:.1f}s）, out_sample_rate={self.out_sample_rate}Hz")
+
+    def _resolve_reference(self, ref: Optional[str]) -> Optional[str]:
+        if not ref:
+            return None
+        p = Path(ref)
+        if not p.is_absolute():
+            p = PROJECT_DIR / p
+        return str(p)
+
+    def _edge_voice_for_character(self, character: str) -> str:
+        profile = self.profile_manager.get(character)
+        return profile.edge_voice or "zh-TW-YunJheNeural"
+
+    def _build_kwargs(self, text: str, character: str, mood: Optional[str], expression_tags: Optional[list[str]]) -> dict:
+        profile = self.profile_manager.get(character)
+        compiled = compile_text(
+            text=text,
+            mood=mood,
+            expression_tags=expression_tags,
+            profile_description=profile.description,
+        )
+        kwargs = {
+            "text": compiled,
+            "cfg_value": 2.0,
+            "inference_timesteps": 10,
+        }
+        if profile.mode in {"clone", "ultimate_clone"} and profile.reference:
+            ref = self._resolve_reference(profile.reference)
+            if ref:
+                kwargs["reference_wav_path"] = ref
+        return kwargs
+
+    def synthesize_with_edge(self, text: str, character: str, output_path: str | Path) -> dict:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        voice = self._edge_voice_for_character(character)
+        try:
+            import edge_tts  # type: ignore
+        except Exception:
+            return {
+                "ok": False,
+                "engine": "edge_tts",
+                "reason": "edge_tts_not_installed",
+                "hint": "pip install edge-tts",
+            }
+
+        async def _run() -> None:
+            communicate = edge_tts.Communicate(text=text, voice=voice)
+            await communicate.save(str(output_path))
+
+        asyncio.run(_run())
+        return {
+            "ok": True,
+            "engine": "edge_tts",
+            "voice": voice,
+            "output_path": str(output_path),
+            "format": output_path.suffix.lstrip(".") or "mp3",
+        }
+
+    def synthesize_file(
+        self,
+        text: str,
+        character: str,
+        output_path: str | Path,
+        mood: Optional[str] = None,
+        expression_tags: Optional[list[str]] = None,
+        ambience: str = "none",
+        output_format: str = "mp3",
+    ) -> dict:
+        self.load_model()
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._acquire_gpu(f"file:{character}")
+        try:
+            kwargs = self._build_kwargs(text, character, mood, expression_tags)
+            wav = self._model.generate(**kwargs)
+            arr = wav.cpu().numpy() if hasattr(wav, "cpu") else wav
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim == 2:
+                arr = arr.squeeze(0)
+            arr = normalize_rms(arr, target_rms=0.08)
+
+            sr = self.out_sample_rate
+            wav_path = output_path if output_path.suffix.lower() == ".wav" else output_path.with_suffix(".wav")
+            sf.write(str(wav_path), arr, sr)
+
+            final_path = wav_path
+            if ambience and ambience != "none":
+                post_path = wav_path.with_name(f"{wav_path.stem}.post.wav")
+                post_process(wav_path, post_path, ambience_profile=ambience, normalize=0.08)
+                wav_path.unlink(missing_ok=True)
+                final_path = post_path
+
+            if output_format == "mp3":
+                mp3_path = output_path if output_path.suffix.lower() == ".mp3" else output_path.with_suffix(".mp3")
+                cmd = [
+                    "ffmpeg", "-y", "-i", str(final_path),
+                    "-codec:a", "libmp3lame", "-b:a", "128k",
+                    str(mp3_path),
+                ]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                if r.returncode != 0:
+                    return {
+                        "ok": False,
+                        "reason": f"ffmpeg 轉 MP3 失敗: {r.stderr[:300]}",
+                        "output_path": str(final_path),
+                        "format": "wav",
+                    }
+                final_path.unlink(missing_ok=True)
+                final_path = mp3_path
+
+            return {
+                "ok": True,
+                "engine": "voxcpm",
+                "output_path": str(final_path),
+                "format": output_format,
+                "sample_rate": sr,
+                "character": character,
+            }
+        except Exception as e:
+            # 檔案模式自動 fallback 到 edge_tts，避免失聲
+            edge_out = output_path if output_path.suffix.lower() == ".mp3" else output_path.with_suffix(".mp3")
+            edge = self.synthesize_with_edge(text=text, character=character, output_path=edge_out)
+            if edge.get("ok"):
+                edge["fallback_from"] = f"voxcpm_error: {e}"
+                return edge
+            return {
+                "ok": False,
+                "reason": f"voxcpm_failed_and_edge_failed: {e}; {edge.get('reason', 'unknown')}",
+            }
+        finally:
+            self._release_gpu()
+
+    def stream_chunks(
+        self,
+        text: str,
+        character: str,
+        mood: Optional[str] = None,
+        expression_tags: Optional[list[str]] = None,
+        stop_event: Optional[threading.Event] = None,
+        ambience: str = "none",
+    ):
+        """yield float32 mono chunks（crossfade 去邊界 click/pop + 即時 ambience）。"""
+        self.load_model()
+
+        self._acquire_gpu(f"stream:{character}")
+        try:
+            kwargs = self._build_kwargs(text, character, mood, expression_tags)
+            sr = self.out_sample_rate
+            overlap = max(1, int(sr * 0.006))  # 6ms
+            ambience_fx = StreamAmbience(ambience, sr)
+
+            prev: Optional[np.ndarray] = None
+            for chunk in self._model.generate_streaming(**kwargs):
+                if stop_event and stop_event.is_set():
+                    break
+                c = np.asarray(chunk, dtype=np.float32).reshape(-1)
+                c = ambience_fx.process(c)
+                c = normalize_rms(c, target_rms=0.08)
+
+                if prev is None:
+                    prev = c
+                    continue
+
+                out, tail = crossfade_chunks(prev, c, overlap)
+                if out.size:
+                    yield out
+                prev = tail if tail.size else None
+
+            if prev is not None and prev.size and not (stop_event and stop_event.is_set()):
+                yield prev
+        finally:
+            self._release_gpu()
+
+
+# ---------------------------------------------------------------------------
+# Discord 串流 AudioSource
+# ---------------------------------------------------------------------------
+class StreamAudioSource(discord.AudioSource):
     DISCORD_SAMPLE_RATE = 48000
     DISCORD_CHANNELS = 2
+    FRAME_SIZE = 960  # 20ms @ 48kHz
+    FRAME_BYTES = FRAME_SIZE * DISCORD_CHANNELS * 2  # s16le
 
-    @staticmethod
-    def wav_to_pcm(wav_path: str | Path) -> str:
-        """ffmpeg 轉碼：WAV → PCM s16le 48kHz stereo（Discord 規格）"""
-        pcm_path = str(wav_path) + ".pcm"
-        cmd = [
-            "ffmpeg", "-y", "-i", str(wav_path),
-            "-f", "s16le",
-            "-acodec", "pcm_s16le",
-            "-ar", str(AudioPipeline.DISCORD_SAMPLE_RATE),
-            "-ac", str(AudioPipeline.DISCORD_CHANNELS),
-            pcm_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg PCM 轉碼失敗：{result.stderr[:300]}")
-        return pcm_path
+    def __init__(self):
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+        self._finished = False
+        self._error: Optional[str] = None
+        self._sent_last_frame = False
 
-    @staticmethod
-    def make_audio_source(pcm_path: str) -> FFmpegPCMAudio:
-        """從 PCM 檔建立 Discord AudioSource"""
-        return FFmpegPCMAudio(
-            pcm_path,
-            before_options="-f s16le -ar 48000 -ac 2",
-        )
+    @property
+    def error(self) -> Optional[str]:
+        return self._error
 
-    @staticmethod
-    def wav_to_mp3_buffer(wav_path: str | Path) -> discord.File:
-        """WAV → MP3 轉檔，回傳 discord.File（用於檔案模式推送）"""
-        mp3_path = str(wav_path).rsplit(".", 1)[0] + "_send.mp3"
-        cmd = [
-            "ffmpeg", "-y", "-i", str(wav_path),
-            "-codec:a", "libmp3lame", "-b:a", "128k",
-            mp3_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        if result.returncode != 0:
-            # fallback：直接發 WAV
-            return discord.File(str(wav_path), filename=Path(wav_path).name)
-        return discord.File(mp3_path, filename=Path(mp3_path).name)
+    def put_data(self, pcm_bytes: bytes):
+        with self._lock:
+            self._buffer.extend(pcm_bytes)
+
+    def mark_finished(self):
+        with self._lock:
+            self._finished = True
+
+    def set_error(self, message: str):
+        with self._lock:
+            self._error = message
+            self._finished = True
+
+    def read(self) -> bytes:
+        with self._lock:
+            if self._error:
+                return b""
+
+            if len(self._buffer) >= self.FRAME_BYTES:
+                frame = bytes(self._buffer[: self.FRAME_BYTES])
+                del self._buffer[: self.FRAME_BYTES]
+                return frame
+
+            if self._finished:
+                if self._sent_last_frame:
+                    return b""
+                remaining = bytes(self._buffer)
+                self._buffer.clear()
+                pad_len = max(0, self.FRAME_BYTES - len(remaining))
+                self._sent_last_frame = True
+                return remaining + (b"\x00" * pad_len)
+
+            # underflow：短暫靜音墊片
+            return b"\x00" * self.FRAME_BYTES
+
+    def is_opus(self) -> bool:
+        return False
+
+
+@dataclass
+class ActiveStream:
+    task_id: str
+    source: StreamAudioSource
+    stop_event: threading.Event
+    producer_thread: threading.Thread
+    character: str
 
 
 # ---------------------------------------------------------------------------
-# Bot 主體
+# Bot
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-# 全域狀態
-_skill: Optional[VoxCpmSkill] = None
+bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"), intents=intents)
 _router = OutputRouter(default_mode=OutputMode.AUTO)
-_pipeline = AudioPipeline()
+_engine = VoxCpmEngine(PROFILES_PATH)
+_active_streams: dict[int, ActiveStream] = {}
+_task_counter = itertools.count(1)
 
 
-def _get_skill() -> VoxCpmSkill:
-    """延遲載入 VoxCPM 模型（首次指令時才載入，避免啟動慢）"""
-    global _skill
-    if _skill is None:
-        print("⏳ 載入 VoxCPM 模型（首次需 ~22s）...")
-        _skill = VoxCpmSkill(profiles_path=str(PROFILES_PATH), min_free_gb=2.0)
-        print("✅ VoxCPM 模型已載入")
-    return _skill
+def _next_task_id(prefix: str = "T") -> str:
+    return f"{prefix}{next(_task_counter):04d}"
 
 
+# ---------------------------------------------------------------------------
+# 工具函式
+# ---------------------------------------------------------------------------
 def _parse_args(text: str) -> dict:
-    """解析指令參數：角色 + 台詞 + flags
-
-    格式：[-f] [-s] [--mood MOOD] [--ambience AMBIENCE] <角色> <台詞...>
-    """
     parts = text.strip().split()
     flags = {"file": False, "stream": False}
     named = {"mood": None, "ambience": "none"}
@@ -206,116 +528,433 @@ def _parse_args(text: str) -> dict:
 
     character = positional[0] if len(positional) > 0 else ""
     line = " ".join(positional[1:]) if len(positional) > 1 else ""
-
     return {**flags, **named, "character": character, "text": line}
 
 
-async def _send_text_sync(ctx: commands.Context, text: str, character: str):
-    """所有語音輸出都同步發文字版"""
+def _get_active_stream(guild_id: int) -> Optional[ActiveStream]:
+    return _active_streams.get(guild_id)
+
+
+def _set_active_stream(guild_id: int, stream: ActiveStream):
+    _active_streams[guild_id] = stream
+
+
+def _clear_active_stream(guild_id: int):
+    _active_streams.pop(guild_id, None)
+
+
+async def _send_text_sync(ctx, text: str, character: str):
     await ctx.send(f"**{character}**：{text}")
 
 
-async def _synthesize_and_play_stream(
-    ctx: commands.Context,
-    skill: VoxCpmSkill,
-    character: str,
-    text: str,
-    mood: str = None,
-    ambience: str = "none",
+def _parse_mode_flags(args: str) -> dict:
+    parts = args.strip().split() if args else []
+    return {
+        "file": "-f" in parts,
+        "stream": "-s" in parts,
+    }
+
+
+def _load_tianji_report() -> dict:
+    script = Path.home() / ".hermes" / "scripts" / "tianji-report.py"
+    if not script.exists():
+        return {"error": f"tianji script not found: {script}"}
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        if result.returncode != 0:
+            return {"error": f"tianji-report failed: {result.stderr.strip()[:200]}"}
+        return json.loads(result.stdout)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _build_morning_lines(report: dict) -> list[tuple[str, str]]:
+    if not report or report.get("error"):
+        return [
+            ("司天監·李淳風", "啟稟主公，今日天機報載入失敗，請准許以簡報模式先行。"),
+            ("軍師·諸葛亮", "主公萬安。語音早朝系統已可用，請裁示是否改以文字早朝。"),
+        ]
+
+    date_str = report.get("date", "今日")
+    weekday = report.get("weekday", "")
+    lunar = report.get("lunar_date", {}).get("lunar_display", "")
+    solar = report.get("solar_term", {})
+    current_term = solar.get("current_term") or ""
+    next_term = solar.get("next_term") or ""
+    days_next = solar.get("days_until_next")
+
+    holiday = report.get("holiday_check", {})
+    is_holiday = bool(holiday.get("isHoliday"))
+    holiday_text = "休沐日" if is_holiday else "工作日"
+
+    weather = report.get("weather", {})
+    weather_brief = weather.get("brief") if isinstance(weather, dict) else None
+    if not weather_brief:
+        weather_brief = "天候資料暫缺"
+
+    todo = report.get("todo_status", {}).get("summary", {})
+    pending = todo.get("pending", 0)
+    delayed = todo.get("delayed", 0)
+    suspected = todo.get("suspected_delay", 0)
+
+    line1 = f"主公萬安。今日 {date_str} 星期{weekday}，農曆{lunar}。"
+    if next_term and days_next is not None:
+        line2 = f"當前節氣{current_term}，距{next_term}尚有{days_next}日；今日為{holiday_text}。"
+    else:
+        line2 = f"今日為{holiday_text}。"
+    line3 = f"氣象簡報：{weather_brief}。"
+    line4 = f"待辦總覽：待辦{pending}件，延遲{delayed}件，疑似延遲{suspected}件。"
+
+    return [
+        ("司天監·李淳風", line1),
+        ("司天監·李淳風", line2),
+        ("司天監·李淳風", line3),
+        ("御史·魏徵", line4),
+        ("軍師·諸葛亮", "請主公裁示今日首要政務，臣等即刻分辦。"),
+    ]
+
+
+def _build_greeting_lines(report: dict) -> list[tuple[str, str]]:
+    if not report or report.get("error"):
+        return [
+            ("司天監·李淳風", "啟稟主公，今日節慶資料暫不可得，先行呈上日常問候。"),
+            ("待詔·唐伯虎", "主公萬安，願今日諸事順意，心境清朗。"),
+            ("軍師·諸葛亮", "若有要務，孔明隨時聽候調度。"),
+        ]
+
+    date_str = report.get("date", "今日")
+    weekday = report.get("weekday", "")
+    today_festivals = report.get("today_festival", []) or []
+    solar = report.get("solar_term", {})
+    current_term = solar.get("current_term") or ""
+    next_term = solar.get("next_term") or ""
+    days_next = solar.get("days_until_next")
+    holiday = report.get("holiday_check", {})
+    is_holiday = bool(holiday.get("isHoliday"))
+
+    if today_festivals:
+        ftxt = "、".join(today_festivals)
+        line1 = f"主公萬安。今日 {date_str} 星期{weekday}，適逢{ftxt}。"
+        line2 = "值此佳節，願主公福澤綿長、萬事亨通。"
+        line3 = "孔明謹獻節日問候，祝王朝諸務昌隆。"
+        return [
+            ("司天監·李淳風", line1),
+            ("待詔·唐伯虎", line2),
+            ("軍師·諸葛亮", line3),
+        ]
+
+    if current_term:
+        if next_term and days_next is not None:
+            line1 = f"主公萬安。今日 {date_str} 星期{weekday}，當前節氣為{current_term}。"
+            line2 = f"距{next_term}尚有{days_next}日，願主公順時養氣，諸事安泰。"
+        else:
+            line1 = f"主公萬安。今日 {date_str} 星期{weekday}，當前節氣為{current_term}。"
+            line2 = "願主公應時而行，萬務皆得其宜。"
+        line3 = "孔明謹以節氣問候，願王朝行穩致遠。"
+        return [
+            ("司天監·李淳風", line1),
+            ("待詔·唐伯虎", line2),
+            ("軍師·諸葛亮", line3),
+        ]
+
+    holiday_text = "休沐日" if is_holiday else "工作日"
+    return [
+        ("司天監·李淳風", f"主公萬安。今日 {date_str} 星期{weekday}，為{holiday_text}。"),
+        ("待詔·唐伯虎", "願主公今日心神寧定，所行皆順。"),
+        ("軍師·諸葛亮", "如需調度，孔明即刻承命。"),
+    ]
+
+
+def _build_drama_text_summary(result: dict) -> str:
+    preview = result.get("preview", [])
+    lines = [
+        "🎭 **廣播劇摘要**",
+        f"  劇本：`{result.get('script_path', '')}`",
+        f"  段數：`{result.get('segments', 0)}`",
+        f"  時長：`{result.get('duration_sec', 0):.1f}s`",
+    ]
+    if preview:
+        lines.append("  片段預覽：")
+        for row in preview:
+            lines.append(f"  - **{row['speaker']}**：{row['text']}")
+    return "\n".join(lines)
+
+
+def _build_drama_transcript_chunks(result: dict, max_len: int = 1800) -> list[str]:
+    lines = result.get("transcript_lines", []) or []
+    if not lines:
+        return []
+
+    chunks: list[str] = []
+    buf = "📝 **廣播劇文字同步**\n"
+    for row in lines:
+        one = f"**{row['speaker']}**：{row['text']}\n"
+        if len(buf) + len(one) > max_len:
+            chunks.append(buf.rstrip())
+            buf = "📝 **廣播劇文字同步（續）**\n" + one
+        else:
+            buf += one
+    if buf.strip():
+        chunks.append(buf.rstrip())
+    return chunks
+
+
+async def _send_drama_transcript_timed(
+    ctx,
+    timeline: list[dict],
+    speed: float = 1.0,
+    lead_seconds: float = 0.55,
 ):
-    """串流模式：語音頻道播放 + 文字頻道同步"""
-    # 1. 檢查是否在語音頻道
-    if not ctx.author.voice or not ctx.author.voice.channel:
-        await ctx.send("⚠️ 主公不在語音頻道，請先加入語音頻道或使用 `-f` 走檔案模式")
+    """串流模式：依時間軸逐句同步文字（預設提前 0.55s）。"""
+    if not timeline:
         return
 
-    # 2. Bot 加入語音頻道
-    vc: VoiceClient = ctx.voice_client
+    try:
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+
+        for row in timeline:
+            start_at = float(row.get("start_sec", 0.0)) / max(speed, 1e-6)
+            emit_at = max(0.0, start_at - lead_seconds)
+            now = loop.time() - t0
+            wait_s = emit_at - now
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+            await ctx.send(f"**{row['speaker']}**：{row['text']}")
+    except Exception:
+        # 不影響主流程播放
+        return
+
+
+def _convert_wav_to_mp3(wav_path: str, mp3_path: str) -> tuple[bool, str]:
+    cmd = [
+        "ffmpeg", "-y", "-i", wav_path,
+        "-codec:a", "libmp3lame", "-b:a", "128k", mp3_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=False)
+        if proc.returncode != 0:
+            return False, (proc.stderr or proc.stdout or "ffmpeg failed")[:200]
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _render_drama_audio(script_path: str, output_wav: str, max_segments: int = 30) -> dict:
+    parser = DialogueParser()
+    segments = parser.parse_file(script_path)
+
+    if not segments:
+        return {"ok": False, "reason": "劇本沒有可解析段落"}
+    if len(segments) > max_segments:
+        return {"ok": False, "reason": f"段數超限（{len(segments)} > {max_segments}）"}
+
+    profiles = _engine.profile_manager._profiles
+    unknown = sorted({seg.speaker for seg in segments if seg.speaker not in profiles})
+    if unknown:
+        return {"ok": False, "reason": f"角色未定義：{', '.join(unknown)}"}
+
+    sr_target = _engine.out_sample_rate
+    audios: list[np.ndarray] = []
+    preview: list[dict] = []
+    transcript_lines: list[dict] = []
+    transcript_timeline: list[dict] = []
+    cursor_sec = 0.0
+
+    with tempfile.TemporaryDirectory(prefix="wangdom_drama_") as td:
+        for i, seg in enumerate(segments):
+            seg_path = Path(td) / f"seg_{i:04d}.wav"
+            res = _engine.synthesize_file(
+                text=seg.text,
+                character=seg.speaker,
+                output_path=seg_path,
+                mood=seg.mood,
+                ambience="none",
+                output_format="wav",
+            )
+            if not res.get("ok"):
+                return {"ok": False, "reason": f"第{i+1}段生成失敗：{res.get('reason', 'unknown')}"}
+
+            audio, sr = sf.read(str(seg_path), dtype="float32")
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
+            if int(sr) != int(sr_target):
+                audio = _resample_audio(audio, int(sr), int(sr_target))
+            audio = normalize_rms(audio, target_rms=0.08)
+            seg_duration = len(audio) / float(sr_target)
+            audios.append(audio.astype(np.float32))
+
+            pause_sec = float(getattr(seg, "pause_after", 0.5) or 0.5)
+            if i < len(segments) - 1 and pause_sec > 0:
+                audios.append(np.zeros(int(sr_target * pause_sec), dtype=np.float32))
+
+            if len(preview) < 3:
+                t = seg.text.replace("\n", " ").strip()
+                preview.append({"speaker": seg.speaker, "text": (t[:42] + "…") if len(t) > 42 else t})
+
+            transcript_lines.append({
+                "speaker": seg.speaker,
+                "text": seg.text.replace("\n", " ").strip(),
+            })
+            transcript_timeline.append({
+                "speaker": seg.speaker,
+                "text": seg.text.replace("\n", " ").strip(),
+                "start_sec": round(cursor_sec, 3),
+                "duration_sec": round(seg_duration, 3),
+            })
+            cursor_sec += seg_duration + (pause_sec if i < len(segments) - 1 and pause_sec > 0 else 0.0)
+
+    merged = np.concatenate(audios) if audios else np.zeros(1, dtype=np.float32)
+    sf.write(output_wav, merged, sr_target)
+
+    return {
+        "ok": True,
+        "output_path": output_wav,
+        "script_path": str(script_path),
+        "segments": len(segments),
+        "duration_sec": len(merged) / float(sr_target),
+        "preview": preview,
+        "transcript_lines": transcript_lines,
+        "transcript_timeline": transcript_timeline,
+    }
+
+
+async def _ensure_voice_client(ctx):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return None
+    vc = ctx.voice_client
     if vc is None:
         vc = await ctx.author.voice.channel.connect()
     elif vc.channel != ctx.author.voice.channel:
         await vc.move_to(ctx.author.voice.channel)
+    return vc
 
-    # 3. 生成語音
-    status_msg = await ctx.send(f"🎵 {character} 正在生成語音...")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time() * 1000)
-    wav_path = OUTPUT_DIR / f"say_{ts}.wav"
 
-    result = skill.synthesize(
-        text=text,
-        character=character,
-        output_path=str(wav_path),
-        mood=mood,
-        ambience_profile=ambience,
-        output_format="wav",  # 串流用 WAV，不轉 MP3
-    )
-
-    if not result.get("ok"):
-        await status_msg.edit(content=f"❌ 語音生成失敗：{result.get('reason', '未知錯誤')}")
+async def _synthesize_and_play_stream(ctx, character: str, text: str, mood=None, ambience="none"):
+    vc = await _ensure_voice_client(ctx)
+    if vc is None:
+        await ctx.send("⚠️ 主公不在語音頻道，請先加入或使用 `-f`")
         return
 
-    actual_wav = result["output_path"]
+    guild_id = ctx.guild.id if ctx.guild else 0
+    current = _get_active_stream(guild_id)
+    if current:
+        await ctx.send(f"⚠️ 目前已有串流任務進行中（{current.task_id}：{current.character}），請稍候或 `!stop`。")
+        return
 
-    # 4. 同步發文字
+    if vc.is_playing():
+        vc.stop()
+
+    task_id = _next_task_id("S")
+    status_msg = await ctx.send(f"🎵 [{task_id}] {character} 正在串流生成...")
     await _send_text_sync(ctx, text, character)
 
-    # 5. WAV → PCM → 播放
+    source = StreamAudioSource()
+    stop_event = threading.Event()
+
+    def _producer():
+        try:
+            for chunk in _engine.stream_chunks(
+                text=text,
+                character=character,
+                mood=mood,
+                expression_tags=None,
+                stop_event=stop_event,
+                ambience=ambience,
+            ):
+                if stop_event.is_set():
+                    break
+                pcm = mono_float_to_pcm_s16le_stereo(chunk, sample_rate=_engine.out_sample_rate)
+                source.put_data(pcm)
+        except Exception as e:
+            source.set_error(str(e))
+        finally:
+            source.mark_finished()
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    producer_thread.start()
+    _set_active_stream(
+        guild_id,
+        ActiveStream(
+            task_id=task_id,
+            source=source,
+            stop_event=stop_event,
+            producer_thread=producer_thread,
+            character=character,
+        ),
+    )
+
+    def _after_play(_err):
+        stop_event.set()
+
+    # 給一點初始 buffer
+    await asyncio.sleep(0.12)
+    vc.play(source, after=_after_play)
+    await status_msg.edit(content=f"🔊 [{task_id}] {character} 正在播放...")
+
     try:
-        pcm_path = _pipeline.wav_to_pcm(actual_wav)
-        source = _pipeline.make_audio_source(pcm_path)
+        while vc.is_playing():
+            await asyncio.sleep(0.05)
+        await asyncio.get_running_loop().run_in_executor(None, lambda: producer_thread.join(timeout=3.0))
 
-        def _after_play(err):
-            # 播放完清理暫存
-            for p in [actual_wav, pcm_path]:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            if err:
-                print(f"⚠️ 播放錯誤：{err}")
+        if source.error:
+            await ctx.send(f"⚠️ [{task_id}] 串流失敗，改走 Edge fallback：{source.error[:120]}")
+            fb_path = OUTPUT_DIR / f"fallback_{int(time.time()*1000)}.mp3"
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _engine.synthesize_with_edge(text=text, character=character, output_path=fb_path),
+            )
+            if result.get("ok") and Path(result["output_path"]).exists():
+                fallback_source = discord.FFmpegPCMAudio(
+                    str(result["output_path"]),
+                    options="-vn -f s16le -ar 48000 -ac 2",
+                )
+                vc.play(fallback_source)
+                await ctx.send(f"🔁 [{task_id}] 已切換 Edge fallback 續播")
+            else:
+                await ctx.send(f"❌ [{task_id}] fallback 失敗：{result.get('reason', '未知')}" )
+    finally:
+        stop_event.set()
+        _clear_active_stream(guild_id)
 
-        vc.play(source, after=_after_play)
-        await status_msg.edit(content=f"🔊 {character} 正在播放...")
-    except Exception as e:
-        await status_msg.edit(content=f"❌ 播放失敗：{e}")
 
-
-async def _synthesize_and_send_file(
-    ctx: commands.Context,
-    skill: VoxCpmSkill,
-    character: str,
-    text: str,
-    mood: str = None,
-    ambience: str = "none",
-):
-    """檔案模式：生成 MP3 發文字頻道 + 文字版"""
-    status_msg = await ctx.send(f"🎵 {character} 正在生成語音...")
+async def _synthesize_and_send_file(ctx, character: str, text: str, mood=None, ambience="none"):
+    status_msg = await ctx.send(f"🎵 {character} 正在生成語音檔...（若串流中將自動排隊）")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = int(time.time() * 1000)
     out_path = OUTPUT_DIR / f"say_{ts}.mp3"
 
-    result = skill.synthesize(
-        text=text,
-        character=character,
-        output_path=str(out_path),
-        mood=mood,
-        ambience_profile=ambience,
-        output_format="mp3",
+    result = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: _engine.synthesize_file(
+            text=text,
+            character=character,
+            output_path=out_path,
+            mood=mood,
+            ambience=ambience,
+            output_format="mp3",
+        ),
     )
 
     if not result.get("ok"):
-        await status_msg.edit(content=f"❌ 語音生成失敗：{result.get('reason', '未知錯誤')}")
+        await status_msg.edit(content=f"❌ 語音生成失敗：{result.get('reason', '未知')}" )
         return
 
     actual_path = result["output_path"]
-    audio_file = _pipeline.wav_to_mp3_buffer(actual_path)
+    if not Path(actual_path).exists():
+        await status_msg.edit(content="❌ 語音檔案未產生")
+        return
 
-    # 發送文字 + 語音
+    audio_file = discord.File(actual_path, filename=Path(actual_path).name)
     await ctx.send(f"**{character}**：{text}", file=audio_file)
     await status_msg.delete()
 
-    # 清理
     try:
         Path(actual_path).unlink(missing_ok=True)
     except Exception:
@@ -323,53 +962,53 @@ async def _synthesize_and_send_file(
 
 
 # ---------------------------------------------------------------------------
-# Bot 事件
+# 事件
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     print(f"✅ 王朝語音 Bot 已上線：{bot.user}")
-    print(f"   伺服器：{[g.name for g in bot.guilds]}")
     print(f"   輸出模式：{_router.default_mode}")
+    print("   VRAM 策略：常駐模型（啟動載入一次）")
+    try:
+        synced = await bot.tree.sync()
+        print(f"   Slash 指令已同步：{len(synced)}")
+    except Exception as e:
+        print(f"   ⚠️ Slash 同步失敗：{e}")
 
 
 # ---------------------------------------------------------------------------
 # 指令
 # ---------------------------------------------------------------------------
 @bot.command(name="join")
-async def cmd_join(ctx: commands.Context):
-    """加入主公所在語音頻道"""
+async def cmd_join(ctx):
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.send("⚠️ 主公不在任何語音頻道")
         return
-    channel = ctx.author.voice.channel
-    if ctx.voice_client is not None:
-        await ctx.voice_client.move_to(channel)
+    ch = ctx.author.voice.channel
+    if ctx.voice_client:
+        await ctx.voice_client.move_to(ch)
     else:
-        await channel.connect()
-    await ctx.send(f"✅ 已加入 **{channel.name}**")
+        await ch.connect()
+    await ctx.send(f"✅ 已加入 **{ch.name}**")
 
 
 @bot.command(name="leave")
-async def cmd_leave(ctx: commands.Context):
-    """離開語音頻道"""
-    if ctx.voice_client is not None:
+async def cmd_leave(ctx):
+    if ctx.voice_client:
+        guild_id = ctx.guild.id if ctx.guild else 0
+        active = _get_active_stream(guild_id)
+        if active:
+            active.stop_event.set()
         await ctx.voice_client.disconnect()
+        _clear_active_stream(guild_id)
         await ctx.send("👋 已離開語音頻道")
     else:
         await ctx.send("⚠️ 不在任何語音頻道")
 
 
 @bot.command(name="say")
-async def cmd_say(ctx: commands.Context, *, args: str = ""):
-    """生成角色語音並播放/推送
-
-    用法：
-      !say 諸葛亮 稟主公
-      !say -f 諸葛亮 稟主公        (檔案模式)
-      !say -s 諸葛亮 稟主公        (串流模式)
-      !say --mood 急切 魏徵 稟主公 (帶情緒)
-      !say --ambience hall 劉邦 退朝 (帶音場)
-    """
+async def cmd_say(ctx, *, args: str = ""):
+    """生成角色語音：!say [-f|-s] [--mood 情緒] [--ambience 音場] <角色> <台詞>"""
     if not args:
         await ctx.send("用法：`!say [-f|-s] [--mood 情緒] [--ambience 音場] <角色> <台詞>`")
         return
@@ -379,34 +1018,26 @@ async def cmd_say(ctx: commands.Context, *, args: str = ""):
     text = parsed["text"]
 
     if not character or not text:
-        await ctx.send("⚠️ 請指定角色和台詞，例如：`!say 諸葛亮 稟主公`")
+        await ctx.send("⚠️ 請指定角色和台詞，例如：`!say 軍師·諸葛亮 稟主公`")
         return
 
-    skill = _get_skill()
-
-    # 解析輸出模式
     mode = _router.resolve(ctx, flag_file=parsed["file"], flag_stream=parsed["stream"])
 
     if mode == OutputMode.STREAM:
         await _synthesize_and_play_stream(
-            ctx, skill, character, text,
+            ctx, character, text,
             mood=parsed["mood"], ambience=parsed["ambience"],
         )
     else:
         await _synthesize_and_send_file(
-            ctx, skill, character, text,
+            ctx, character, text,
             mood=parsed["mood"], ambience=parsed["ambience"],
         )
 
 
 @bot.command(name="play")
-async def cmd_play(ctx: commands.Context, *, args: str = ""):
-    """播放既有音頻檔
-
-    用法：
-      !play test_output/morning_court.mp3     (串流)
-      !play -f test_output/morning_court.mp3  (檔案)
-    """
+async def cmd_play(ctx, *, args: str = ""):
+    """播放既有音頻檔：!play [-f|-s] <檔案路徑>"""
     if not args:
         await ctx.send("用法：`!play [-f|-s] <檔案路徑>`")
         return
@@ -423,17 +1054,16 @@ async def cmd_play(ctx: commands.Context, *, args: str = ""):
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
     if mode == OutputMode.STREAM:
-        if not ctx.author.voice or not ctx.author.voice.channel:
+        vc = await _ensure_voice_client(ctx)
+        if vc is None:
             await ctx.send("⚠️ 主公不在語音頻道，請先加入或使用 `-f`")
             return
-        vc: VoiceClient = ctx.voice_client
-        if vc is None:
-            vc = await ctx.author.voice.channel.connect()
-        elif vc.channel != ctx.author.voice.channel:
-            await vc.move_to(ctx.author.voice.channel)
 
-        pcm_path = _pipeline.wav_to_pcm(file_path)
-        source = _pipeline.make_audio_source(pcm_path)
+        # 用 FFmpegPCMAudio 直接播既有音檔
+        source = discord.FFmpegPCMAudio(
+            str(file_path),
+            options="-vn -f s16le -ar 48000 -ac 2",
+        )
         vc.play(source)
         await ctx.send(f"🔊 正在播放：`{Path(file_path).name}`")
     else:
@@ -442,27 +1072,60 @@ async def cmd_play(ctx: commands.Context, *, args: str = ""):
 
 
 @bot.command(name="stop")
-async def cmd_stop(ctx: commands.Context):
-    """停止目前播放"""
+async def cmd_stop(ctx, task_id: str = ""):
+    guild_id = ctx.guild.id if ctx.guild else 0
+    active = _get_active_stream(guild_id)
+
+    if active and task_id and active.task_id != task_id:
+        await ctx.send(f"⚠️ 目前執行中任務為 `{active.task_id}`，未匹配 `{task_id}`")
+        return
+
+    if active:
+        active.stop_event.set()
+        active.source.mark_finished()
+
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.stop()
-        await ctx.send("⏹ 已停止播放")
+
+    if active:
+        await asyncio.get_running_loop().run_in_executor(None, lambda: active.producer_thread.join(timeout=2.0))
+        _clear_active_stream(guild_id)
+        await ctx.send(f"⏹ 已停止任務 `{active.task_id}` 並回收串流資源")
     else:
         await ctx.send("⚠️ 目前沒有在播放")
 
 
-@bot.command(name="mode")
-async def cmd_mode(ctx: commands.Context, mode: str = ""):
-    """切換全域輸出模式
+@bot.command(name="queue")
+async def cmd_queue(ctx):
+    guild_id = ctx.guild.id if ctx.guild else 0
+    active = _get_active_stream(guild_id)
+    snap = _engine.queue_snapshot()
+    lines = [
+        "**📋 語音任務佇列**",
+        f"  引擎狀態：`{'忙碌' if snap['busy'] else '空閒'}`",
+        f"  等待中：`{snap['waiting']}`",
+        f"  執行中：`{snap['active_job'] or '無'}`",
+    ]
+    if active:
+        lines.append(f"  當前串流：`{active.task_id}` / `{active.character}`")
+    else:
+        lines.append("  當前串流：`無`")
+    await ctx.send("\n".join(lines))
 
-    用法：
-      !mode auto    — 智慧切換（在語音頻道→串流，不在→檔案）
-      !mode stream  — 強制串流
-      !mode file    — 強制檔案
-    """
+
+@bot.command(name="cancel")
+async def cmd_cancel(ctx, task_id: str = ""):
+    if not task_id:
+        await ctx.send("用法：`!cancel <task_id>`（可用 `!queue` 查看）")
+        return
+    await cmd_stop(ctx, task_id=task_id)
+
+
+@bot.command(name="mode")
+async def cmd_mode(ctx, mode: str = ""):
     valid = {OutputMode.AUTO, OutputMode.STREAM, OutputMode.FILE}
     if mode.lower() not in valid:
-        await ctx.send("用法：`!mode auto|stream|file`\n目前模式：`{_router.default_mode}`")
+        await ctx.send(f"用法：`!mode auto|stream|file`\n目前模式：`{_router.default_mode}`")
         return
     _router.default_mode = mode.lower()
     labels = {OutputMode.AUTO: "智慧切換", OutputMode.STREAM: "串流", OutputMode.FILE: "檔案"}
@@ -470,33 +1133,26 @@ async def cmd_mode(ctx: commands.Context, mode: str = ""):
 
 
 @bot.command(name="voices")
-async def cmd_voices(ctx: commands.Context):
-    """列出可用角色"""
-    mgr = VoiceProfileManager(PROFILES_PATH)
-    profiles = mgr._profiles
+async def cmd_voices(ctx):
+    profiles = _engine.profile_manager._profiles
     if not profiles:
         await ctx.send("⚠️ 沒有載入到任何角色設定")
         return
 
     lines = ["📜 **可用角色列表（17位）**："]
-    for i, (name, p) in enumerate(profiles.items(), 1):
-        mode_icon = "🎤" if p.mode == "clone" else "🔊"
-        lines.append(f"  {i:02d}. {mode_icon} **{name}**（{p.mode}）")
+    for i, (name, _p) in enumerate(profiles.items(), 1):
+        lines.append(f"  {i:02d}. 🎤 **{name}**")
 
-    lines.append("\n用法：`!say <角色名> <台詞>`")
     text = "\n".join(lines)
-
-    # Discord 訊息長度限制 2000
     if len(text) > 1900:
-        # 分兩段
         mid = len(profiles) // 2
-        first_half = list(profiles.items())[:mid]
-        second_half = list(profiles.items())[mid:]
+        first = list(profiles.items())[:mid]
+        second = list(profiles.items())[mid:]
         t1 = "📜 **可用角色（1/2）**：\n" + "\n".join(
-            f"  {i+1:02d}. 🎤 **{n}**" for i, (n, _) in enumerate(first_half)
+            f"  {i+1:02d}. 🎤 **{n}**" for i, (n, _) in enumerate(first)
         )
         t2 = "📜 **可用角色（2/2）**：\n" + "\n".join(
-            f"  {i+mid+1:02d}. 🎤 **{n}**" for i, (n, _) in enumerate(second_half)
+            f"  {i+mid+1:02d}. 🎤 **{n}**" for i, (n, _) in enumerate(second)
         )
         await ctx.send(t1)
         await ctx.send(t2)
@@ -505,24 +1161,31 @@ async def cmd_voices(ctx: commands.Context):
 
 
 @bot.command(name="status")
-async def cmd_status(ctx: commands.Context):
-    """顯示 Bot 狀態"""
+async def cmd_status(ctx):
+    guild_id = ctx.guild.id if ctx.guild else 0
+    active = _get_active_stream(guild_id)
+    snap = _engine.queue_snapshot()
+
     lines = [
         "**🏥 王朝語音 Bot 狀態**",
         f"  Bot：`{bot.user}`",
         f"  語音頻道：`{ctx.voice_client.channel.name if ctx.voice_client else '未連接'}`",
         f"  播放中：`{'是' if ctx.voice_client and ctx.voice_client.is_playing() else '否'}`",
         f"  輸出模式：`{_router.default_mode}`",
-        f"  VoxCPM 模型：`{'已載入' if _skill else '未載入（首次 !say 時載入）'}`",
+        f"  引擎：`常駐 VoxCPM + Edge fallback`",
+        f"  模型載入：`{'是' if _engine.model_loaded else '否'}`",
+        f"  佇列：`busy={snap['busy']}, waiting={snap['waiting']}`",
+        f"  執行中：`{snap['active_job'] or '無'}`",
+        f"  當前串流：`{(active.task_id + ' / ' + active.character) if active else '無'}`",
     ]
 
-    # VRAM 資訊
     try:
         import torch
+
         if torch.cuda.is_available():
             free, total = torch.cuda.mem_get_info()
-            used_gb = (total - free) / (1024**3)
-            total_gb = total / (1024**3)
+            used_gb = (total - free) / (1024 ** 3)
+            total_gb = total / (1024 ** 3)
             lines.append(f"  VRAM：`{used_gb:.1f} / {total_gb:.1f} GB`")
     except Exception:
         pass
@@ -530,68 +1193,398 @@ async def cmd_status(ctx: commands.Context):
     await ctx.send("\n".join(lines))
 
 
-# ---------------------------------------------------------------------------
-# Phase 2 預留指令（框架先建，功能後補）
-# ---------------------------------------------------------------------------
+# Slash 指令（message content intent 失效時的保險）
+@bot.tree.command(name="join", description="加入你目前所在的語音頻道")
+async def slash_join(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道使用 /join", ephemeral=True)
+        return
+    user = interaction.user
+    voice_state = getattr(user, "voice", None)
+    if not voice_state or not voice_state.channel:
+        await interaction.response.send_message("⚠️ 你目前不在語音頻道", ephemeral=True)
+        return
+    channel = voice_state.channel
+    vc = interaction.guild.voice_client
+    if vc:
+        await vc.move_to(channel)
+    else:
+        await channel.connect()
+    await interaction.response.send_message(f"✅ 已加入 **{channel.name}**")
+
+
+@bot.tree.command(name="leave", description="離開語音頻道")
+async def slash_leave(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道使用 /leave", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc:
+        await vc.disconnect()
+        await interaction.response.send_message("👋 已離開語音頻道")
+    else:
+        await interaction.response.send_message("⚠️ 目前不在語音頻道", ephemeral=True)
+
+
+@bot.tree.command(name="status", description="查看語音 Bot 狀態")
+async def slash_status(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道使用 /status", ephemeral=True)
+        return
+    snap = _engine.queue_snapshot()
+    vc = interaction.guild.voice_client
+    lines = [
+        "**🏥 王朝語音 Bot 狀態**",
+        f"  Bot：`{bot.user}`",
+        f"  語音頻道：`{vc.channel.name if vc else '未連接'}`",
+        f"  播放中：`{'是' if vc and vc.is_playing() else '否'}`",
+        f"  模型載入：`{'是' if _engine.model_loaded else '否'}`",
+        f"  佇列：`busy={snap['busy']}, waiting={snap['waiting']}`",
+        f"  執行中：`{snap['active_job'] or '無'}`",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+# Phase 2 預留
 @bot.command(name="morning")
-async def cmd_morning(ctx: commands.Context, *, args: str = ""):
-    """播放當日早朝
+async def cmd_morning(ctx, *, args: str = ""):
+    flags = _parse_mode_flags(args)
+    mode = _router.resolve(ctx, flag_file=flags["file"], flag_stream=flags["stream"])
 
-    用法：!morning / !morning -f
-    """
-    # 解析 flag
-    flag_file = "-f" in args.split()
-    flag_stream = "-s" in args.split()
-    mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
+    await ctx.send("🌅 早朝語音整備中，正在載入天機報...")
+    report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
+    lines = _build_morning_lines(report)
 
-    await ctx.send("⏳ 早朝語音生成中...（功能開發中，敬請期待）")
-    # TODO: 整合 tianji-report.py → 生成語音 → 播放/推送
+    if report.get("error"):
+        await ctx.send(f"⚠️ 天機報載入異常：{report['error']}")
+
+    for character, text in lines:
+        if mode == OutputMode.STREAM:
+            await _synthesize_and_play_stream(ctx, character, text, mood="沉穩", ambience="hall")
+        else:
+            await _synthesize_and_send_file(ctx, character, text, mood="沉穩", ambience="hall")
+
+    await ctx.send("✅ 早朝語音播報完畢")
 
 
 @bot.command(name="greeting")
-async def cmd_greeting(ctx: commands.Context, *, args: str = ""):
-    """播放節日問候
+async def cmd_greeting(ctx, *, args: str = ""):
+    flags = _parse_mode_flags(args)
+    mode = _router.resolve(ctx, flag_file=flags["file"], flag_stream=flags["stream"])
 
-    用法：!greeting / !greeting -f
-    """
-    flag_file = "-f" in args.split()
-    flag_stream = "-s" in args.split()
-    mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
+    await ctx.send("🎀 節日問候整備中，正在載入天機報...")
+    report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
+    lines = _build_greeting_lines(report)
 
-    await ctx.send("⏳ 節日問候生成中...（功能開發中，敬請期待）")
-    # TODO: 整合司天監節慶判定 → 生成問候語音 → 播放/推送
+    if report.get("error"):
+        await ctx.send(f"⚠️ 天機報載入異常：{report['error']}")
+
+    for character, text in lines:
+        if mode == OutputMode.STREAM:
+            await _synthesize_and_play_stream(ctx, character, text, mood="溫暖", ambience="hall")
+        else:
+            await _synthesize_and_send_file(ctx, character, text, mood="溫暖", ambience="hall")
+
+    await ctx.send("✅ 節日問候播報完畢")
 
 
 @bot.command(name="drama")
-async def cmd_drama(ctx: commands.Context, *, args: str = ""):
-    """多人廣播劇
-
-    用法：!drama 劇本.txt / !drama -f 劇本.txt
-    """
-    flag_file = "-f" in args.split()
-    flag_stream = "-s" in args.split()
-    file_path = " ".join(p for p in args.split() if p not in {"-f", "-s"})
-
-    if not file_path:
-        await ctx.send("用法：`!drama [-f|-s] <劇本路徑>`")
+async def cmd_drama(ctx, *, args: str = ""):
+    """多人廣播劇：!drama [-f|-s] <script_path>"""
+    if not args.strip():
+        await ctx.send("用法：`!drama [-f|-s] <script_path>`")
         return
 
-    await ctx.send("⏳ 廣播劇生成中...（功能開發中，敬請期待）")
-    # TODO: 整合 dialogue_parser + merger → 多人語音 → 播放/推送
+    parts = args.strip().split()
+    flag_file = "-f" in parts
+    flag_stream = "-s" in parts
+    script_path = " ".join(p for p in parts if p not in {"-f", "-s"}).strip()
+
+    if not script_path:
+        await ctx.send("⚠️ 請提供劇本檔案路徑")
+        return
+
+    script_file = Path(script_path)
+    if not script_file.exists():
+        await ctx.send(f"⚠️ 劇本檔案不存在：`{script_path}`")
+        return
+
+    mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time() * 1000)
+    drama_wav = OUTPUT_DIR / f"drama_{ts}.wav"
+
+    status_msg = await ctx.send("🎭 廣播劇生成中，請稍候...")
+    result = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
+    )
+
+    if not result.get("ok"):
+        await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
+        return
+
+    summary = _build_drama_text_summary(result)
+    transcript_chunks = _build_drama_transcript_chunks(result)
+    transcript_timeline = result.get("transcript_timeline", []) or []
+
+    if mode == OutputMode.STREAM:
+        vc = await _ensure_voice_client(ctx)
+        if vc is None:
+            await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
+            return
+
+        if vc.is_playing():
+            vc.stop()
+
+        source = discord.FFmpegPCMAudio(
+            str(drama_wav),
+            options="-vn -f s16le -ar 48000 -ac 2",
+        )
+        vc.play(source)
+        await status_msg.edit(content="🔊 廣播劇已開始播放")
+        await ctx.send(summary)
+        if transcript_timeline:
+            await ctx.send("📝 **廣播劇文字同步（逐句）**")
+            first = transcript_timeline[0]
+            await ctx.send(f"**{first['speaker']}**：{first['text']}")
+            if len(transcript_timeline) > 1:
+                shifted = []
+                base = float(transcript_timeline[1].get("start_sec", 0.0))
+                for row in transcript_timeline[1:]:
+                    shifted.append({
+                        "speaker": row["speaker"],
+                        "text": row["text"],
+                        "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
+                    })
+                asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+    else:
+        drama_mp3 = OUTPUT_DIR / f"drama_{ts}.mp3"
+        ok, err = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _convert_wav_to_mp3(str(drama_wav), str(drama_mp3)),
+        )
+        if not ok:
+            await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+            return
+
+        await status_msg.edit(content="✅ 廣播劇已生成")
+        await ctx.send(summary)
+        for chunk in transcript_chunks:
+            await ctx.send(chunk)
+        await ctx.send(
+            "📎 廣播劇語音檔",
+            file=discord.File(str(drama_mp3), filename=drama_mp3.name),
+        )
+
+
+def _split_weekly_paragraphs(text: str) -> list[str]:
+    raw = text.replace("\r\n", "\n")
+    blocks = [b.strip() for b in raw.split("\n\n") if b.strip()]
+    if blocks:
+        return blocks
+    return [ln.strip() for ln in raw.split("\n") if ln.strip()]
+
+
+def _build_weekly_segments(report_text: str) -> list[dict]:
+    parts = _split_weekly_paragraphs(report_text)
+    roles = ["軍師·諸葛亮", "丞相·曾國藩", "御史·魏徵", "軍師·諸葛亮"]
+    heads = ["本週總覽", "里程碑進展", "風險與稽核", "下週計畫"]
+
+    segs: list[dict] = []
+    for i in range(4):
+        content = parts[i] if i < len(parts) else "本段暫無資料。"
+        content = content.strip()
+        if not content:
+            content = "本段暫無資料。"
+        if heads[i] not in content:
+            content = f"{heads[i]}：{content}"
+        segs.append({"speaker": roles[i], "text": content})
+    return segs
+
+
+def _build_weekly_summary(result: dict) -> str:
+    return "\n".join([
+        "🗞️ **有聲週報摘要**",
+        f"  來源：`{result.get('source_path', '')}`",
+        f"  段數：`{result.get('segments', 0)}`",
+        f"  時長：`{result.get('duration_sec', 0):.1f}s`",
+    ])
+
+
+def _build_weekly_transcript_chunks(result: dict, max_len: int = 1800) -> list[str]:
+    lines = result.get("transcript_lines", []) or []
+    if not lines:
+        return []
+    chunks: list[str] = []
+    buf = "📝 **週報文字同步**\n"
+    for row in lines:
+        one = f"**{row['speaker']}**：{row['text']}\n"
+        if len(buf) + len(one) > max_len:
+            chunks.append(buf.rstrip())
+            buf = "📝 **週報文字同步（續）**\n" + one
+        else:
+            buf += one
+    if buf.strip():
+        chunks.append(buf.rstrip())
+    return chunks
+
+
+def _render_weekly_audio(report_text: str, output_wav: str, source_path: str) -> dict:
+    segments = _build_weekly_segments(report_text)
+
+    profiles = _engine.profile_manager._profiles
+    unknown = sorted({seg['speaker'] for seg in segments if seg['speaker'] not in profiles})
+    if unknown:
+        return {"ok": False, "reason": f"角色未定義：{', '.join(unknown)}"}
+
+    sr_target = _engine.out_sample_rate
+    audios: list[np.ndarray] = []
+    transcript_lines: list[dict] = []
+    transcript_timeline: list[dict] = []
+    cursor_sec = 0.0
+
+    with tempfile.TemporaryDirectory(prefix="wangdom_weekly_") as td:
+        for i, seg in enumerate(segments):
+            seg_path = Path(td) / f"weekly_{i:04d}.wav"
+            res = _engine.synthesize_file(
+                text=seg["text"],
+                character=seg["speaker"],
+                output_path=seg_path,
+                mood="沉穩",
+                ambience="none",
+                output_format="wav",
+            )
+            if not res.get("ok"):
+                return {"ok": False, "reason": f"第{i+1}段生成失敗：{res.get('reason', 'unknown')}"}
+
+            audio, sr = sf.read(str(seg_path), dtype="float32")
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
+            if int(sr) != int(sr_target):
+                audio = _resample_audio(audio, int(sr), int(sr_target))
+            audio = normalize_rms(audio, target_rms=0.08)
+            seg_duration = len(audio) / float(sr_target)
+            audios.append(audio.astype(np.float32))
+
+            transcript_lines.append({"speaker": seg["speaker"], "text": seg["text"]})
+            transcript_timeline.append({
+                "speaker": seg["speaker"],
+                "text": seg["text"],
+                "start_sec": round(cursor_sec, 3),
+                "duration_sec": round(seg_duration, 3),
+            })
+
+            pause_sec = 0.6 if i < len(segments) - 1 else 0.0
+            cursor_sec += seg_duration + pause_sec
+            if pause_sec > 0:
+                audios.append(np.zeros(int(sr_target * pause_sec), dtype=np.float32))
+
+    merged = np.concatenate(audios) if audios else np.zeros(1, dtype=np.float32)
+    sf.write(output_wav, merged, sr_target)
+
+    return {
+        "ok": True,
+        "output_path": output_wav,
+        "source_path": source_path,
+        "segments": len(segments),
+        "duration_sec": len(merged) / float(sr_target),
+        "transcript_lines": transcript_lines,
+        "transcript_timeline": transcript_timeline,
+    }
 
 
 @bot.command(name="weekly")
-async def cmd_weekly(ctx: commands.Context, *, args: str = ""):
-    """播放有聲週報
+async def cmd_weekly(ctx, *, args: str = ""):
+    """有聲週報：!weekly [-f|-s] <weekly_txt_path>"""
+    if not args.strip():
+        await ctx.send("用法：`!weekly [-f|-s] <weekly_txt_path>`")
+        return
 
-    用法：!weekly / !weekly -f
-    """
-    flag_file = "-f" in args.split()
-    flag_stream = "-s" in args.split()
+    parts = args.strip().split()
+    flag_file = "-f" in parts
+    flag_stream = "-s" in parts
+    report_path = " ".join(p for p in parts if p not in {"-f", "-s"}).strip()
+
+    if not report_path:
+        await ctx.send("⚠️ 請提供週報文字檔路徑")
+        return
+
+    report_file = Path(report_path)
+    if not report_file.exists():
+        await ctx.send(f"⚠️ 週報檔案不存在：`{report_path}`")
+        return
+
+    report_text = report_file.read_text(encoding="utf-8").strip()
+    if not report_text:
+        await ctx.send("⚠️ 週報內容為空")
+        return
+
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
-    await ctx.send("⏳ 有聲週報生成中...（功能開發中，敬請期待）")
-    # TODO: 彙整 Vault 週變更 → 生成語音 → 播放/推送
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time() * 1000)
+    weekly_wav = OUTPUT_DIR / f"weekly_{ts}.wav"
+
+    status_msg = await ctx.send("🗞️ 週報生成中，請稍候...")
+    result = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: _render_weekly_audio(report_text, str(weekly_wav), str(report_file)),
+    )
+
+    if not result.get("ok"):
+        await status_msg.edit(content=f"❌ 週報生成失敗：{result.get('reason', '未知錯誤')}")
+        return
+
+    summary = _build_weekly_summary(result)
+    transcript_chunks = _build_weekly_transcript_chunks(result)
+    transcript_timeline = result.get("transcript_timeline", []) or []
+
+    if mode == OutputMode.STREAM:
+        vc = await _ensure_voice_client(ctx)
+        if vc is None:
+            await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
+            return
+        if vc.is_playing():
+            vc.stop()
+
+        source = discord.FFmpegPCMAudio(
+            str(weekly_wav),
+            options="-vn -f s16le -ar 48000 -ac 2",
+        )
+        vc.play(source)
+        await status_msg.edit(content="🔊 有聲週報已開始播放")
+        await ctx.send(summary)
+        if transcript_timeline:
+            await ctx.send("📝 **週報文字同步（逐句）**")
+            first = transcript_timeline[0]
+            await ctx.send(f"**{first['speaker']}**：{first['text']}")
+            if len(transcript_timeline) > 1:
+                shifted = []
+                base = float(transcript_timeline[1].get("start_sec", 0.0))
+                for row in transcript_timeline[1:]:
+                    shifted.append({
+                        "speaker": row["speaker"],
+                        "text": row["text"],
+                        "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
+                    })
+                asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+    else:
+        weekly_mp3 = OUTPUT_DIR / f"weekly_{ts}.mp3"
+        ok, err = await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: _convert_wav_to_mp3(str(weekly_wav), str(weekly_mp3)),
+        )
+        if not ok:
+            await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+            return
+
+        await status_msg.edit(content="✅ 有聲週報已生成")
+        await ctx.send(summary)
+        for chunk in transcript_chunks:
+            await ctx.send(chunk)
+        await ctx.send("📎 有聲週報語音檔", file=discord.File(str(weekly_mp3), filename=weekly_mp3.name))
 
 
 # ---------------------------------------------------------------------------
@@ -600,11 +1593,12 @@ async def cmd_weekly(ctx: commands.Context, *, args: str = ""):
 def main():
     token = os.environ.get("VOICE_BOT_TOKEN")
     if not token:
-        print("❌ 請設定環境變數 VOICE_BOT_TOKEN")
-        print("   export VOICE_BOT_TOKEN='your-bot-token-here'")
+        print("❌ 請設定 VOICE_BOT_TOKEN（.env 或環境變數）")
         sys.exit(1)
 
     print("🚀 崴勝王朝語音 Bot 啟動中...")
+    print("📦 預先載入 VoxCPM 模型（常駐）...")
+    _engine.load_model()
     bot.run(token)
 
 

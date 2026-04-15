@@ -1,0 +1,17 @@
+[Unit]
+Description=Wangdom VoxCPM Discord Voice Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes01/projects/VoxCPM
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/hermes01/projects/VoxCPM/venv/bin/python /home/hermes01/projects/VoxCPM/scripts/wangdom/discord_voice_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/hermes01/projects/VoxCPM/output/voice-bot.log
+StandardError=append:/home/hermes01/projects/VoxCPM/output/voice-bot.log
+
+[Install]
+WantedBy=default.target
