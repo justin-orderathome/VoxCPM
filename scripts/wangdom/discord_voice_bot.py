@@ -1553,6 +1553,7 @@ async def cmd_morningcron(ctx, *, args: str = ""):
             "guild_id": int(ctx.guild.id),
             "channel_id": int(ctx.channel.id),
             "voice_channel_id": resolved_voice_channel_id,
+            "last_run_date": None,
         }
     )
     _save_morning_schedule(cfg)
