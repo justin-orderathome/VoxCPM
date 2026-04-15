@@ -1,0 +1,158 @@
+{
+  "target_rms": 0.04,
+  "results": [
+    {
+      "file": "ref_1.wav",
+      "old_rms": 0.03,
+      "old_peak": 0.2554,
+      "gain": 1.3333,
+      "new_peak": 0.3405,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_2.wav",
+      "old_rms": 0.027972,
+      "old_peak": 0.1329,
+      "gain": 1.43,
+      "new_peak": 0.1901,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_3.wav",
+      "old_rms": 0.027992,
+      "old_peak": 0.2526,
+      "gain": 1.429,
+      "new_peak": 0.361,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_bao_zheng.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.1011,
+      "gain": 1.3334,
+      "new_peak": 0.1348,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_da_yu.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.265,
+      "gain": 1.3334,
+      "new_peak": 0.3534,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_di_renjie.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.3217,
+      "gain": 1.3334,
+      "new_peak": 0.4289,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_fan_li.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.2742,
+      "gain": 1.3334,
+      "new_peak": 0.3656,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_guan_zhong.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.173,
+      "gain": 1.3334,
+      "new_peak": 0.2307,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_han_xin.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.1291,
+      "gain": 1.3334,
+      "new_peak": 0.1722,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_li_bing.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.2526,
+      "gain": 1.3334,
+      "new_peak": 0.3368,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_li_chunfeng.wav",
+      "old_rms": 0.030001,
+      "old_peak": 0.2878,
+      "gain": 1.3333,
+      "new_peak": 0.3838,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_liu_bei.wav",
+      "old_rms": 0.03,
+      "old_peak": 0.3645,
+      "gain": 1.3333,
+      "new_peak": 0.486,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_lord_liu_bang.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.2534,
+      "gain": 1.3334,
+      "new_peak": 0.3379,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_qi_jiguang.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.2628,
+      "gain": 1.3334,
+      "new_peak": 0.3504,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_su_qin.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.3445,
+      "gain": 1.3334,
+      "new_peak": 0.4594,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_wei_zheng.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.3263,
+      "gain": 1.3334,
+      "new_peak": 0.4351,
+      "clip": false,
+      "status": "OK"
+    },
+    {
+      "file": "ref_zeng_guofan.wav",
+      "old_rms": 0.029999,
+      "old_peak": 0.2721,
+      "gain": 1.3334,
+      "new_peak": 0.3628,
+      "clip": false,
+      "status": "OK"
+    }
+  ]
+}
