@@ -1007,6 +1007,12 @@ async def _ensure_voice_client(ctx, preferred_voice_channel_id: Optional[int] = 
     target_channel = None
     if preferred_voice_channel_id and guild:
         target_channel = guild.get_channel(int(preferred_voice_channel_id))
+        # Fallback: fetch from REST API if not in cache
+        if target_channel is None:
+            try:
+                target_channel = await guild.fetch_channel(int(preferred_voice_channel_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
     if target_channel is None:
         author = getattr(ctx, "author", None)
