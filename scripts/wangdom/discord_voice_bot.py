@@ -67,6 +67,34 @@ MORNING_CONFIG_PATH = PROJECT_DIR / "profiles" / "morning_schedule.json"
 TW_TZ = ZoneInfo("Asia/Taipei")
 HEARTBEAT_PATH = PROJECT_DIR / "output" / "voice-bot-heartbeat.json"
 
+# ---------------------------------------------------------------------------
+# 角色emoji對照表
+# ---------------------------------------------------------------------------
+ROLE_EMOJI = {
+    "主公·劉邦": "👑",
+    "軍師·諸葛亮": "🪶",
+    "丞相·曾國藩": "🏔️",
+    "御史·魏徵": "🎋",
+    "禮部·紀曉嵐": "📚",
+    "戶部·范蠡": "💰",
+    "太府·管仲": "🦚",
+    "鴻臚·蘇秦": "🎀",
+    "兵部·戚繼光": "⚔️",
+    "刑部·狄仁傑": "⚖️",
+    "工部·李冰": "🌊",
+    "待詔·唐伯虎": "🌸",
+    "大理·包拯": "🌙",
+    "將軍·韓信": "🐴",
+    "司空·大禹": "🌊",
+    "使君·劉備": "🍑",
+    "司天監·李淳風": "🔮",
+}
+
+
+def _fmt_line(text: str, speaker: str) -> str:
+    emoji = ROLE_EMOJI.get(speaker, "")
+    return f"\u200b\n\n{emoji}{text}（{speaker}）"
+
 
 # ---------------------------------------------------------------------------
 # 輸出路由
@@ -556,7 +584,7 @@ def _clear_active_stream(guild_id: int):
 
 
 async def _send_text_sync(ctx, text: str, character: str):
-    await ctx.send(f"**{character}**：{text}")
+    await ctx.send(_fmt_line(text, character))
 
 
 def _parse_mode_flags(args: str) -> dict:
@@ -884,9 +912,9 @@ async def _send_drama_transcript_timed(
     ctx,
     timeline: list[dict],
     speed: float = 1.0,
-    lead_seconds: float = 0.55,
+    lead_seconds: float = 0.35,
 ):
-    """串流模式：依時間軸逐句同步文字（預設提前 0.55s）。"""
+    """串流模式：依時間軸逐句同步文字（預設提前 0.2s）。"""
     if not timeline:
         return
 
@@ -901,7 +929,7 @@ async def _send_drama_transcript_timed(
             wait_s = emit_at - now
             if wait_s > 0:
                 await asyncio.sleep(wait_s)
-            await ctx.send(f"**{row['speaker']}**：{row['text']}")
+            await ctx.send(_fmt_line(row['text'], row['speaker']))
     except Exception:
         # 不影響主流程播放
         return
@@ -1704,7 +1732,7 @@ async def cmd_drama(ctx, *, args: str = ""):
             if transcript_timeline:
                 await ctx.send("📝 **廣播劇文字同步（逐句）**")
                 first = transcript_timeline[0]
-                await ctx.send(f"**{first['speaker']}**：{first['text']}")
+                await ctx.send(_fmt_line(first['text'], first['speaker']))
                 if len(transcript_timeline) > 1:
                     shifted = []
                     base = float(transcript_timeline[1].get("start_sec", 0.0))
@@ -1926,7 +1954,7 @@ async def cmd_weekly(ctx, *, args: str = ""):
             if transcript_timeline:
                 await ctx.send("📝 **週報文字同步（逐句）**")
                 first = transcript_timeline[0]
-                await ctx.send(f"**{first['speaker']}**：{first['text']}")
+                await ctx.send(_fmt_line(first['text'], first['speaker']))
                 if len(transcript_timeline) > 1:
                     shifted = []
                     base = float(transcript_timeline[1].get("start_sec", 0.0))
@@ -2289,7 +2317,9 @@ async def _api_drama(request):
                 )
                 vc.play(source_audio)
                 await ctx.send("🎭 廣播劇播放中（API 觸發）")
-                await ctx.send(summary)
+                asyncio.create_task(_send_drama_transcript_timed(
+                    ctx, result.get("transcript_timeline", []),
+                ))
                 while vc.is_playing():
                     await asyncio.sleep(0.5)
             else:
