@@ -2032,8 +2032,8 @@ async def _api_health(_request):
     """GET /status — Bot 全域健康"""
     return aioweb.json_response({
         "ok": True,
-        "model_loaded": _engine.model_loaded(),
-        "busy": _engine.busy(),
+        "model_loaded": _engine.model_loaded,
+        "busy": _engine.busy,
         "queue": _engine.queue_snapshot(),
         "active_streams": {
             str(gid): {"task_id": s.task_id, "character": s.character}
