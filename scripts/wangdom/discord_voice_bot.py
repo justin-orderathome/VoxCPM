@@ -1030,17 +1030,17 @@ async def _synthesize_and_play_stream(
     mood=None,
     ambience="none",
     preferred_voice_channel_id: Optional[int] = None,
-):
+) -> bool:
     vc = await _ensure_voice_client(ctx, preferred_voice_channel_id=preferred_voice_channel_id)
     if vc is None:
         await ctx.send("⚠️ 找不到可用語音頻道，請先加入語音或於 morning 排程指定 voice_channel_id")
-        return
+        return False
 
     guild_id = ctx.guild.id if ctx.guild else 0
     current = _get_active_stream(guild_id)
     if current:
         await ctx.send(f"⚠️ 目前已有串流任務進行中（{current.task_id}：{current.character}），請稍候或 `!stop`。")
-        return
+        return False
 
     if vc.is_playing():
         vc.stop()
@@ -1116,6 +1116,8 @@ async def _synthesize_and_play_stream(
     finally:
         stop_event.set()
         _clear_active_stream(guild_id)
+
+    return True
 
 
 async def _synthesize_and_send_file(ctx, character: str, text: str, mood=None, ambience="none"):
@@ -2115,12 +2117,16 @@ async def _api_say(request):
             rec.status = "running"
             rec.started_at = datetime.now(TW_TZ).isoformat()
             try:
-                await _synthesize_and_play_stream(
+                ok = await _synthesize_and_play_stream(
                     ctx, character, text, mood=mood, ambience=ambience,
                     preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
                 )
-                rec.status = "done"
-                rec.progress = "1/1"
+                if ok:
+                    rec.status = "done"
+                    rec.progress = "1/1"
+                else:
+                    rec.status = "failed"
+                    rec.error = "找不到可用語音頻道或已有串流進行中"
             except Exception as e:
                 rec.status = "failed"
                 rec.error = str(e)
