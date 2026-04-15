@@ -30,6 +30,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import soundfile as sf
 
+try:
+    from aiohttp import web as aioweb
+    _HAS_AIOHTTP = True
+except ImportError:
+    _HAS_AIOHTTP = False
+
 # 從專案根目錄 .env 載入環境變數
 from dotenv import load_dotenv
 
@@ -1189,6 +1195,10 @@ async def on_ready():
     # Start heartbeat
     asyncio.create_task(_heartbeat_loop())
 
+    # Start internal API server (if enabled)
+    if _API_ENABLED:
+        await _start_api_server()
+
 
 # ---------------------------------------------------------------------------
 # 全域錯誤處理
@@ -1941,6 +1951,632 @@ async def cmd_weekly(ctx, *, args: str = ""):
             await ctx.send(error_msg)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 內部 API Server（Hermes ↔ 語音 Bot 互通）
+# ---------------------------------------------------------------------------
+
+_API_PORT = int(os.environ.get("VOICE_BOT_API_PORT", "8890"))
+_API_ENABLED = os.environ.get("VOICE_BOT_API_ENABLED", "").lower() in ("true", "1", "yes")
+_ALLOWED_SCRIPT_DIRS: list[Path] = [
+    Path("/tmp"),
+    OUTPUT_DIR,
+    PROJECT_DIR / "scripts",
+    PROJECT_DIR / "test_output",
+]
+_MAX_TEXT_LEN = 2000
+_MAX_BODY_SIZE = 1_048_576  # 1 MB
+
+
+@dataclass
+class TaskRecord:
+    task_id: str
+    status: str            # queued | running | done | failed
+    mode: str              # stream | file
+    progress: str
+    request_id: Optional[str]
+    created_at: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    output_path: Optional[str] = None
+    duration_sec: Optional[float] = None
+    transcript: Optional[str] = None
+    segments: Optional[int] = None
+    error: Optional[str] = None
+
+
+_task_registry: dict[str, TaskRecord] = {}
+_api_task_counter = itertools.count(1)
+
+
+def _next_api_task_id() -> str:
+    return f"T-{datetime.now(TW_TZ).strftime('%Y%m%d')}-{next(_api_task_counter):04d}"
+
+
+def _get_primary_guild() -> Optional[discord.Guild]:
+    return bot.guilds[0] if bot.guilds else None
+
+
+def _validate_script_path(path_str: str) -> tuple[bool, str]:
+    p = Path(path_str).resolve()
+    for allowed in _ALLOWED_SCRIPT_DIRS:
+        try:
+            p.relative_to(allowed.resolve())
+            return True, ""
+        except ValueError:
+            continue
+    return False, f"路徑不在白名單內：{path_str}"
+
+
+class _ApiCtx:
+    """Minimal ctx-like adapter so API handlers can reuse existing service functions."""
+
+    def __init__(self, guild: discord.Guild, text_channel: discord.TextChannel):
+        self.guild = guild
+        self._text_channel = text_channel
+        self.author = None
+
+    @property
+    def voice_client(self):
+        return self.guild.voice_client
+
+    async def send(self, content=None, **kwargs):
+        return await self._text_channel.send(content, **kwargs)
+
+
+# ── API Handlers ─────────────────────────────────────────────────────────
+
+
+async def _api_health(_request):
+    """GET /status — Bot 全域健康"""
+    return aioweb.json_response({
+        "ok": True,
+        "model_loaded": _engine.model_loaded(),
+        "busy": _engine.busy(),
+        "queue": _engine.queue_snapshot(),
+        "active_streams": {
+            str(gid): {"task_id": s.task_id, "character": s.character}
+            for gid, s in _active_streams.items()
+        },
+    })
+
+
+async def _api_task_status(request):
+    """GET /status/{task_id} — 單一任務輪詢"""
+    task_id = request.match_info["task_id"]
+    rec = _task_registry.get(task_id)
+    if not rec:
+        return aioweb.json_response(
+            {"ok": False, "error": f"task_id '{task_id}' not found"}, status=404,
+        )
+    resp: dict = {
+        "ok": True,
+        "task_id": rec.task_id,
+        "status": rec.status,
+        "progress": rec.progress,
+        "started_at": rec.started_at,
+        "finished_at": rec.finished_at,
+        "error": rec.error,
+    }
+    if rec.status in ("done", "failed"):
+        resp["duration_sec"] = rec.duration_sec
+        resp["transcript"] = rec.transcript
+        if rec.output_path:
+            resp["output_path"] = rec.output_path
+        if rec.segments is not None:
+            resp["segments"] = rec.segments
+    return aioweb.json_response(resp)
+
+
+async def _api_say(request):
+    """POST /say — 單句語音"""
+    try:
+        body = await request.json()
+    except Exception:
+        return aioweb.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    mode = body.get("mode", "file")
+    character = body.get("character", "")
+    text = body.get("text", "")
+    text_ch_id = body.get("text_channel_id")
+    voice_ch_id = body.get("voice_channel_id")
+    mood = body.get("mood")
+    ambience = body.get("ambience", "none")
+    request_id = body.get("request_id")
+
+    if not character or not text:
+        return aioweb.json_response({"ok": False, "error": "缺少 character 或 text"}, status=400)
+    if len(text) > _MAX_TEXT_LEN:
+        return aioweb.json_response(
+            {"ok": False, "error": f"文字超過 {_MAX_TEXT_LEN} 字上限"}, status=400,
+        )
+
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+    text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
+    if not text_ch:
+        return aioweb.json_response({"ok": False, "error": "找不到 text_channel_id"}, status=400)
+
+    ctx = _ApiCtx(guild, text_ch)
+    task_id = _next_api_task_id()
+    now = datetime.now(TW_TZ).isoformat()
+
+    if mode == "stream":
+        rec = TaskRecord(
+            task_id=task_id, status="queued", mode="stream",
+            progress="0/1", request_id=request_id,
+            created_at=now, transcript=text,
+        )
+        _task_registry[task_id] = rec
+
+        async def _run():
+            rec.status = "running"
+            rec.started_at = datetime.now(TW_TZ).isoformat()
+            try:
+                await _synthesize_and_play_stream(
+                    ctx, character, text, mood=mood, ambience=ambience,
+                    preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
+                )
+                rec.status = "done"
+                rec.progress = "1/1"
+            except Exception as e:
+                rec.status = "failed"
+                rec.error = str(e)
+            finally:
+                rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+        asyncio.create_task(_run())
+        return aioweb.json_response({
+            "ok": True, "mode": "stream", "task_id": task_id,
+            "status": "queued", "request_id": request_id, "error": None,
+        })
+
+    # ── file mode (synchronous) ──
+    rec = TaskRecord(
+        task_id=task_id, status="running", mode="file",
+        progress="generating", request_id=request_id,
+        created_at=now, started_at=now, transcript=text,
+    )
+    _task_registry[task_id] = rec
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time() * 1000)
+    out_path = OUTPUT_DIR / f"say_api_{ts}.mp3"
+
+    result = await asyncio.get_running_loop().run_in_executor(
+        None,
+        lambda: _engine.synthesize_file(
+            text=text, character=character, output_path=out_path,
+            mood=mood, ambience=ambience, output_format="mp3",
+        ),
+    )
+
+    if not result.get("ok"):
+        rec.status = "failed"
+        rec.error = result.get("reason", "未知錯誤")
+        rec.finished_at = datetime.now(TW_TZ).isoformat()
+        return aioweb.json_response(
+            {"ok": False, "task_id": task_id, "error": rec.error}, status=500,
+        )
+
+    rec.status = "done"
+    rec.progress = "1/1"
+    rec.output_path = result["output_path"]
+    rec.duration_sec = result.get("duration_sec")
+    rec.segments = 1
+    rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+    return aioweb.json_response({
+        "ok": True, "mode": "file", "task_id": task_id, "status": "done",
+        "request_id": request_id, "output_path": rec.output_path,
+        "duration_sec": rec.duration_sec, "segments": 1,
+        "transcript": text, "error": None,
+    })
+
+
+async def _api_drama(request):
+    """POST /drama — 多角色廣播劇"""
+    try:
+        body = await request.json()
+    except Exception:
+        return aioweb.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    mode = body.get("mode", "stream")
+    script_path = body.get("script_path", "")
+    text_ch_id = body.get("text_channel_id")
+    voice_ch_id = body.get("voice_channel_id")
+    request_id = body.get("request_id")
+
+    if not script_path:
+        return aioweb.json_response({"ok": False, "error": "缺少 script_path"}, status=400)
+
+    ok_path, err_path = _validate_script_path(script_path)
+    if not ok_path:
+        return aioweb.json_response({"ok": False, "error": err_path}, status=403)
+
+    script_file = Path(script_path)
+    if not script_file.exists():
+        return aioweb.json_response(
+            {"ok": False, "error": f"劇本不存在：{script_path}"}, status=400,
+        )
+
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+    text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
+    if not text_ch:
+        return aioweb.json_response({"ok": False, "error": "找不到 text_channel_id"}, status=400)
+
+    ctx = _ApiCtx(guild, text_ch)
+    task_id = _next_api_task_id()
+    now = datetime.now(TW_TZ).isoformat()
+
+    rec = TaskRecord(
+        task_id=task_id, status="queued", mode=mode,
+        progress="0/0", request_id=request_id, created_at=now,
+    )
+    _task_registry[task_id] = rec
+
+    async def _run():
+        rec.status = "running"
+        rec.started_at = datetime.now(TW_TZ).isoformat()
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time() * 1000)
+            drama_wav = OUTPUT_DIR / f"drama_api_{ts}.wav"
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
+            )
+
+            if not result.get("ok"):
+                rec.status = "failed"
+                rec.error = result.get("reason", "渲染失敗")
+                rec.finished_at = datetime.now(TW_TZ).isoformat()
+                return
+
+            seg_count = result.get("total_segments", 0)
+            rec.progress = f"{seg_count}/{seg_count}"
+            rec.duration_sec = result.get("duration_sec")
+            t_lines = result.get("transcript_lines", [])
+            rec.transcript = "\n".join(t_lines) if t_lines else ""
+            rec.segments = seg_count
+
+            summary = _build_drama_text_summary(result)
+
+            if mode == "stream":
+                vc = await _ensure_voice_client(
+                    ctx,
+                    preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
+                )
+                if vc is None:
+                    rec.status = "failed"
+                    rec.error = "找不到語音頻道"
+                    rec.finished_at = datetime.now(TW_TZ).isoformat()
+                    return
+                if vc.is_playing():
+                    vc.stop()
+                source_audio = discord.FFmpegPCMAudio(
+                    str(drama_wav), options="-vn -f s16le -ar 48000 -ac 2",
+                )
+                vc.play(source_audio)
+                await ctx.send("🎭 廣播劇播放中（API 觸發）")
+                await ctx.send(summary)
+                while vc.is_playing():
+                    await asyncio.sleep(0.5)
+            else:
+                drama_mp3 = OUTPUT_DIR / f"drama_api_{ts}.mp3"
+                ok_conv, err_conv = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _convert_wav_to_mp3(str(drama_wav), str(drama_mp3)),
+                )
+                if not ok_conv:
+                    rec.status = "failed"
+                    rec.error = f"MP3 轉檔失敗：{err_conv}"
+                    rec.finished_at = datetime.now(TW_TZ).isoformat()
+                    return
+                rec.output_path = str(drama_mp3)
+                await ctx.send(summary)
+
+            rec.status = "done"
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+        except Exception as e:
+            rec.status = "failed"
+            rec.error = str(e)
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+    asyncio.create_task(_run())
+    return aioweb.json_response({
+        "ok": True, "mode": mode, "task_id": task_id,
+        "status": "queued", "request_id": request_id, "error": None,
+    })
+
+
+async def _api_stop(request):
+    """POST /stop — 中止指定或當前任務"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    task_id = body.get("task_id", "")
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+
+    for gid, stream in _active_streams.items():
+        if not task_id or stream.task_id == task_id:
+            stream.stop_event.set()
+            rec = _task_registry.get(stream.task_id)
+            if rec:
+                rec.status = "failed"
+                rec.error = "手動中止（API /stop）"
+                rec.finished_at = datetime.now(TW_TZ).isoformat()
+            return aioweb.json_response({"ok": True, "stopped": stream.task_id})
+
+    return aioweb.json_response(
+        {"ok": False, "error": f"找不到進行中的任務：{task_id}"}, status=404,
+    )
+
+
+async def _api_morning(request):
+    """POST /morning — 早朝廣播"""
+    try:
+        body = await request.json()
+    except Exception:
+        return aioweb.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    mode = body.get("mode", "stream")
+    text_ch_id = body.get("text_channel_id")
+    voice_ch_id = body.get("voice_channel_id")
+    request_id = body.get("request_id")
+
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+    text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
+    if not text_ch:
+        return aioweb.json_response({"ok": False, "error": "找不到 text_channel_id"}, status=400)
+
+    task_id = _next_api_task_id()
+    now = datetime.now(TW_TZ).isoformat()
+    rec = TaskRecord(
+        task_id=task_id, status="queued", mode=mode,
+        progress="0/0", request_id=request_id, created_at=now,
+    )
+    _task_registry[task_id] = rec
+
+    async def _run():
+        rec.status = "running"
+        rec.started_at = datetime.now(TW_TZ).isoformat()
+        try:
+            await _run_morning_broadcast(
+                _ApiCtx(guild, text_ch), mode=mode, mood="沉穩", ambience="hall",
+                preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
+            )
+            rec.status = "done"
+        except Exception as e:
+            rec.status = "failed"
+            rec.error = str(e)
+        finally:
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+    asyncio.create_task(_run())
+    return aioweb.json_response({
+        "ok": True, "task_id": task_id, "status": "queued",
+        "request_id": request_id, "error": None,
+    })
+
+
+async def _api_greeting(request):
+    """POST /greeting — 節慶問候"""
+    try:
+        body = await request.json()
+    except Exception:
+        return aioweb.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    mode = body.get("mode", "stream")
+    text_ch_id = body.get("text_channel_id")
+    voice_ch_id = body.get("voice_channel_id")
+    request_id = body.get("request_id")
+
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+    text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
+    if not text_ch:
+        return aioweb.json_response({"ok": False, "error": "找不到 text_channel_id"}, status=400)
+
+    ctx = _ApiCtx(guild, text_ch)
+    task_id = _next_api_task_id()
+    now = datetime.now(TW_TZ).isoformat()
+    rec = TaskRecord(
+        task_id=task_id, status="queued", mode=mode,
+        progress="0/0", request_id=request_id, created_at=now,
+    )
+    _task_registry[task_id] = rec
+
+    async def _run():
+        rec.status = "running"
+        rec.started_at = datetime.now(TW_TZ).isoformat()
+        try:
+            await ctx.send("🎀 節日問候整備中（API 觸發）...")
+            report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
+            lines = _build_greeting_lines(report)
+            for idx, (character, text) in enumerate(lines, 1):
+                rec.progress = f"{idx}/{len(lines)}"
+                if mode == "stream":
+                    await _synthesize_and_play_stream(
+                        ctx, character, text, mood="溫暖", ambience="hall",
+                        preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
+                    )
+                else:
+                    await _synthesize_and_send_file(ctx, character, text, mood="溫暖", ambience="hall")
+            await ctx.send("✅ 節日問候播報完畢")
+            rec.status = "done"
+        except Exception as e:
+            rec.status = "failed"
+            rec.error = str(e)
+        finally:
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+    asyncio.create_task(_run())
+    return aioweb.json_response({
+        "ok": True, "task_id": task_id, "status": "queued",
+        "request_id": request_id, "error": None,
+    })
+
+
+async def _api_weekly(request):
+    """POST /weekly — 週報播報"""
+    try:
+        body = await request.json()
+    except Exception:
+        return aioweb.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+
+    mode = body.get("mode", "stream")
+    text_ch_id = body.get("text_channel_id")
+    voice_ch_id = body.get("voice_channel_id")
+    source_path = body.get("source_path", "")
+    request_id = body.get("request_id")
+
+    if not source_path:
+        return aioweb.json_response({"ok": False, "error": "缺少 source_path"}, status=400)
+
+    guild = _get_primary_guild()
+    if not guild:
+        return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
+    text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
+    if not text_ch:
+        return aioweb.json_response({"ok": False, "error": "找不到 text_channel_id"}, status=400)
+
+    ctx = _ApiCtx(guild, text_ch)
+    task_id = _next_api_task_id()
+    now = datetime.now(TW_TZ).isoformat()
+    rec = TaskRecord(
+        task_id=task_id, status="queued", mode=mode,
+        progress="0/0", request_id=request_id, created_at=now,
+    )
+    _task_registry[task_id] = rec
+
+    async def _run():
+        rec.status = "running"
+        rec.started_at = datetime.now(TW_TZ).isoformat()
+        try:
+            source_file = Path(source_path)
+            if not source_file.exists():
+                rec.status = "failed"
+                rec.error = f"來源檔案不存在：{source_path}"
+                rec.finished_at = datetime.now(TW_TZ).isoformat()
+                return
+
+            report_text = source_file.read_text(encoding="utf-8")
+
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time() * 1000)
+            weekly_wav = OUTPUT_DIR / f"weekly_api_{ts}.wav"
+
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _render_weekly_audio(report_text, str(weekly_wav), source_path),
+            )
+
+            if not result.get("ok"):
+                rec.status = "failed"
+                rec.error = result.get("reason", "渲染失敗")
+                rec.finished_at = datetime.now(TW_TZ).isoformat()
+                return
+
+            seg_count = len(result.get("segments", []))
+            rec.progress = f"{seg_count}/{seg_count}"
+            rec.duration_sec = result.get("duration_sec")
+            rec.segments = seg_count
+
+            summary = _build_weekly_summary(result)
+            transcript_chunks = _build_weekly_transcript_chunks(result)
+            rec.transcript = "\n".join(transcript_chunks)
+
+            if mode == "stream":
+                vc = await _ensure_voice_client(
+                    ctx,
+                    preferred_voice_channel_id=int(voice_ch_id) if voice_ch_id else None,
+                )
+                if vc is None:
+                    rec.status = "failed"
+                    rec.error = "找不到語音頻道"
+                    rec.finished_at = datetime.now(TW_TZ).isoformat()
+                    return
+                if vc.is_playing():
+                    vc.stop()
+                source_audio = discord.FFmpegPCMAudio(
+                    str(weekly_wav), options="-vn -f s16le -ar 48000 -ac 2",
+                )
+                vc.play(source_audio)
+                await ctx.send("📰 週報播放中（API 觸發）")
+                await ctx.send(summary)
+                while vc.is_playing():
+                    await asyncio.sleep(0.5)
+            else:
+                weekly_mp3 = OUTPUT_DIR / f"weekly_api_{ts}.mp3"
+                ok_conv, err_conv = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _convert_wav_to_mp3(str(weekly_wav), str(weekly_mp3)),
+                )
+                if not ok_conv:
+                    rec.status = "failed"
+                    rec.error = f"MP3 轉檔失敗：{err_conv}"
+                    rec.finished_at = datetime.now(TW_TZ).isoformat()
+                    return
+                rec.output_path = str(weekly_mp3)
+                await ctx.send(summary)
+
+            rec.status = "done"
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+        except Exception as e:
+            rec.status = "failed"
+            rec.error = str(e)
+            rec.finished_at = datetime.now(TW_TZ).isoformat()
+
+    asyncio.create_task(_run())
+    return aioweb.json_response({
+        "ok": True, "task_id": task_id, "status": "queued",
+        "request_id": request_id, "error": None,
+    })
+
+
+# ── API App Factory & Startup ────────────────────────────────────────────
+
+
+def _create_api_app():
+    """Build the aiohttp Application with all routes."""
+    app = aioweb.Application(client_max_size=_MAX_BODY_SIZE)
+    app.router.add_get("/status", _api_health)
+    app.router.add_get("/status/{task_id}", _api_task_status)
+    app.router.add_post("/say", _api_say)
+    app.router.add_post("/drama", _api_drama)
+    app.router.add_post("/morning", _api_morning)
+    app.router.add_post("/greeting", _api_greeting)
+    app.router.add_post("/weekly", _api_weekly)
+    app.router.add_post("/stop", _api_stop)
+    return app
+
+
+async def _start_api_server():
+    """Start the internal API server (called from on_ready)."""
+    if not _HAS_AIOHTTP:
+        print("   ⚠️ aiohttp 未安裝，內部 API 已跳過")
+        return
+    app = _create_api_app()
+    runner = aioweb.AppRunner(app)
+    await runner.setup()
+    site = aioweb.TCPSite(runner, "127.0.0.1", _API_PORT)
+    await site.start()
+    print(f"   🔌 內部 API 已啟動：http://127.0.0.1:{_API_PORT}")
 
 
 # ---------------------------------------------------------------------------
