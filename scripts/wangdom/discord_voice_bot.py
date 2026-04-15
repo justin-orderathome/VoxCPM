@@ -2248,7 +2248,10 @@ async def _api_drama(request):
             rec.progress = f"{seg_count}/{seg_count}"
             rec.duration_sec = result.get("duration_sec")
             t_lines = result.get("transcript_lines", [])
-            rec.transcript = "\n".join(t_lines) if t_lines else ""
+            rec.transcript = "\n".join(
+                f"{l['speaker']}：{l['text']}" if isinstance(l, dict) else str(l)
+                for l in t_lines
+            ) if t_lines else ""
             rec.segments = seg_count
 
             summary = _build_drama_text_summary(result)
