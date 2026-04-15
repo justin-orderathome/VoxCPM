@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import soundfile as sf
@@ -55,6 +57,9 @@ from dialogue_parser import DialogueParser
 PROJECT_DIR = _PROJECT_DIR
 PROFILES_PATH = PROJECT_DIR / "profiles" / "voice_profiles.yaml"
 OUTPUT_DIR = PROJECT_DIR / "test_output" / "voice_bot"
+MORNING_CONFIG_PATH = PROJECT_DIR / "profiles" / "morning_schedule.json"
+TW_TZ = ZoneInfo("Asia/Taipei")
+HEARTBEAT_PATH = PROJECT_DIR / "output" / "voice-bot-heartbeat.json"
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +499,7 @@ _router = OutputRouter(default_mode=OutputMode.AUTO)
 _engine = VoxCpmEngine(PROFILES_PATH)
 _active_streams: dict[int, ActiveStream] = {}
 _task_counter = itertools.count(1)
+_morning_scheduler_task: Optional[asyncio.Task] = None
 
 
 def _next_task_id(prefix: str = "T") -> str:
@@ -553,6 +559,169 @@ def _parse_mode_flags(args: str) -> dict:
         "file": "-f" in parts,
         "stream": "-s" in parts,
     }
+
+
+def _parse_hhmm(value: str) -> Optional[tuple[int, int]]:
+    try:
+        hh, mm = value.strip().split(":")
+        h = int(hh)
+        m = int(mm)
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return h, m
+    except Exception:
+        return None
+    return None
+
+
+def _default_morning_schedule() -> dict:
+    return {
+        "enabled": False,
+        "time": "07:00",
+        "guild_id": None,
+        "channel_id": None,
+        "voice_channel_id": None,
+        "mode": "auto",  # auto | stream | file
+        "mood": "沉穩",
+        "ambience": "hall",
+        "last_run_date": "",
+    }
+
+
+def _load_morning_schedule() -> dict:
+    cfg = _default_morning_schedule()
+    try:
+        if MORNING_CONFIG_PATH.exists():
+            raw = json.loads(MORNING_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                cfg.update(raw)
+    except Exception as e:
+        print(f"⚠️ 讀取 morning 排程設定失敗：{e}")
+    return cfg
+
+
+def _save_morning_schedule(cfg: dict):
+    MORNING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MORNING_CONFIG_PATH.write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+async def _run_morning_broadcast(
+    channel,
+    mode: str = "auto",
+    mood: str = "沉穩",
+    ambience: str = "hall",
+    preferred_voice_channel_id: Optional[int] = None,
+):
+    try:
+        await channel.send("🌅 早朝語音整備中，正在載入天機報...")
+        report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
+        lines = _build_morning_lines(report)
+
+        if report.get("error"):
+            await channel.send(f"⚠️ 天機報載入異常：{report['error']}")
+
+        effective_mode = mode
+        if effective_mode == OutputMode.AUTO:
+            if preferred_voice_channel_id:
+                effective_mode = OutputMode.STREAM
+            elif getattr(channel, "author", None) and getattr(channel.author, "voice", None):
+                effective_mode = OutputMode.STREAM
+            else:
+                effective_mode = OutputMode.FILE
+
+        degraded = False
+        if effective_mode == OutputMode.STREAM and not preferred_voice_channel_id:
+            author_vc = (
+                getattr(channel, "author", None)
+                and getattr(channel.author, "voice", None)
+                and getattr(channel.author.voice, "channel", None)
+            )
+            if not author_vc:
+                degraded = True
+                effective_mode = OutputMode.FILE
+                await channel.send("⚠️ 找不到可用語音頻道，自動降級為檔案模式")
+
+        for idx, (character, text) in enumerate(lines, 1):
+            await channel.send(f"🎭 [{idx}/{len(lines)}] {character} 發言中…")
+            if effective_mode == OutputMode.STREAM:
+                await _synthesize_and_play_stream(
+                    channel,
+                    character,
+                    text,
+                    mood=mood,
+                    ambience=ambience,
+                    preferred_voice_channel_id=preferred_voice_channel_id,
+                )
+            else:
+                await _synthesize_and_send_file(channel, character, text, mood=mood, ambience=ambience)
+
+        await channel.send("✅ 早朝語音播報完畢")
+    except Exception as e:
+        error_msg = f"❌ 早朝播報異常：{type(e).__name__}: {e}"
+        print(error_msg)
+        try:
+            await channel.send(error_msg)
+        except Exception:
+            pass
+
+
+async def _morning_scheduler_loop():
+    await bot.wait_until_ready()
+    print("⏰ Morning scheduler 已啟動")
+
+    while not bot.is_closed():
+        cfg = _load_morning_schedule()
+        if not cfg.get("enabled"):
+            await asyncio.sleep(10)
+            continue
+
+        schedule_time = str(cfg.get("time") or "07:00")
+        parsed = _parse_hhmm(schedule_time)
+        if not parsed:
+            print(f"⚠️ 無效 morning 時間設定：{schedule_time}")
+            await asyncio.sleep(60)
+            continue
+
+        now = datetime.now(TW_TZ)
+        h, m = parsed
+        today_str = now.strftime("%Y-%m-%d")
+        should_run = (now.hour == h and now.minute == m and cfg.get("last_run_date") != today_str)
+
+        if should_run:
+            guild_id = cfg.get("guild_id")
+            channel_id = cfg.get("channel_id")
+            if not guild_id or not channel_id:
+                print("⚠️ morning 排程已啟用但 guild_id/channel_id 未設定")
+            else:
+                guild = bot.get_guild(int(guild_id))
+                channel = guild.get_channel(int(channel_id)) if guild else None
+                if channel is None:
+                    channel = bot.get_channel(int(channel_id))
+                if channel is None:
+                    print(f"⚠️ 找不到 morning 目標頻道：guild={guild_id}, channel={channel_id}")
+                else:
+                    mode = str(cfg.get("mode") or "auto").lower()
+                    if mode not in {OutputMode.AUTO, OutputMode.STREAM, OutputMode.FILE}:
+                        mode = OutputMode.AUTO
+                    try:
+                        await _run_morning_broadcast(
+                            channel,
+                            mode=mode,
+                            mood=str(cfg.get("mood") or "沉穩"),
+                            ambience=str(cfg.get("ambience") or "hall"),
+                            preferred_voice_channel_id=(
+                                int(cfg.get("voice_channel_id")) if cfg.get("voice_channel_id") else None
+                            ),
+                        )
+                        cfg["last_run_date"] = today_str
+                        _save_morning_schedule(cfg)
+                        print(f"✅ morning 已執行：{today_str} {schedule_time}")
+                    except Exception as e:
+                        print(f"❌ morning 執行失敗：{e}")
+
+        await asyncio.sleep(10)
 
 
 def _load_tianji_report() -> dict:
@@ -825,21 +994,40 @@ def _render_drama_audio(script_path: str, output_wav: str, max_segments: int = 3
     }
 
 
-async def _ensure_voice_client(ctx):
-    if not ctx.author.voice or not ctx.author.voice.channel:
+async def _ensure_voice_client(ctx, preferred_voice_channel_id: Optional[int] = None):
+    guild = getattr(ctx, "guild", None)
+    vc = getattr(ctx, "voice_client", None) or (guild.voice_client if guild else None)
+
+    target_channel = None
+    if preferred_voice_channel_id and guild:
+        target_channel = guild.get_channel(int(preferred_voice_channel_id))
+
+    if target_channel is None:
+        author = getattr(ctx, "author", None)
+        if author and getattr(author, "voice", None) and author.voice.channel:
+            target_channel = author.voice.channel
+
+    if target_channel is None:
         return None
-    vc = ctx.voice_client
+
     if vc is None:
-        vc = await ctx.author.voice.channel.connect()
-    elif vc.channel != ctx.author.voice.channel:
-        await vc.move_to(ctx.author.voice.channel)
+        vc = await target_channel.connect()
+    elif vc.channel != target_channel:
+        await vc.move_to(target_channel)
     return vc
 
 
-async def _synthesize_and_play_stream(ctx, character: str, text: str, mood=None, ambience="none"):
-    vc = await _ensure_voice_client(ctx)
+async def _synthesize_and_play_stream(
+    ctx,
+    character: str,
+    text: str,
+    mood=None,
+    ambience="none",
+    preferred_voice_channel_id: Optional[int] = None,
+):
+    vc = await _ensure_voice_client(ctx, preferred_voice_channel_id=preferred_voice_channel_id)
     if vc is None:
-        await ctx.send("⚠️ 主公不在語音頻道，請先加入或使用 `-f`")
+        await ctx.send("⚠️ 找不到可用語音頻道，請先加入語音或於 morning 排程指定 voice_channel_id")
         return
 
     guild_id = ctx.guild.id if ctx.guild else 0
@@ -964,8 +1152,27 @@ async def _synthesize_and_send_file(ctx, character: str, text: str, mood=None, a
 # ---------------------------------------------------------------------------
 # 事件
 # ---------------------------------------------------------------------------
+async def _heartbeat_loop():
+    """每 30 秒寫入心跳檔，供 healthcheck 偵測 Discord 連線存活"""
+    HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    while not bot.is_closed():
+        try:
+            payload = {
+                "timestamp": datetime.now(TW_TZ).isoformat(),
+                "latency_ms": round(bot.latency * 1000, 1),
+                "guilds": len(bot.guilds),
+                "user": str(bot.user),
+            }
+            HEARTBEAT_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+
 @bot.event
 async def on_ready():
+    global _morning_scheduler_task
+
     print(f"✅ 王朝語音 Bot 已上線：{bot.user}")
     print(f"   輸出模式：{_router.default_mode}")
     print("   VRAM 策略：常駐模型（啟動載入一次）")
@@ -974,6 +1181,13 @@ async def on_ready():
         print(f"   Slash 指令已同步：{len(synced)}")
     except Exception as e:
         print(f"   ⚠️ Slash 同步失敗：{e}")
+
+    if _morning_scheduler_task is None or _morning_scheduler_task.done():
+        _morning_scheduler_task = asyncio.create_task(_morning_scheduler_loop())
+        print("   ⏰ morning scheduler background task 已建立")
+
+    # Start heartbeat
+    asyncio.create_task(_heartbeat_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -1248,23 +1462,107 @@ async def slash_status(interaction: discord.Interaction):
 # Phase 2 預留
 @bot.command(name="morning")
 async def cmd_morning(ctx, *, args: str = ""):
+    if not ctx.guild:
+        await ctx.send("⚠️ 請在伺服器頻道中使用 !morning")
+        return
     flags = _parse_mode_flags(args)
     mode = _router.resolve(ctx, flag_file=flags["file"], flag_stream=flags["stream"])
+    await _run_morning_broadcast(ctx, mode=mode, mood="沉穩", ambience="hall")
 
-    await ctx.send("🌅 早朝語音整備中，正在載入天機報...")
-    report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
-    lines = _build_morning_lines(report)
 
-    if report.get("error"):
-        await ctx.send(f"⚠️ 天機報載入異常：{report['error']}")
+@bot.command(name="morningcron")
+async def cmd_morningcron(ctx, *, args: str = ""):
+    """設定早朝排程：!morningcron [on|off|status] [HH:MM] [mode] [voice_channel_id]"""
+    parts = args.strip().split() if args else []
+    action = parts[0].lower() if parts else "status"
 
-    for character, text in lines:
-        if mode == OutputMode.STREAM:
-            await _synthesize_and_play_stream(ctx, character, text, mood="沉穩", ambience="hall")
+    cfg = _load_morning_schedule()
+
+    if action == "status":
+        await ctx.send(
+            "\n".join(
+                [
+                    "**⏰ 早朝排程狀態**",
+                    f"  啟用：`{'是' if cfg.get('enabled') else '否'}`",
+                    f"  時間：`{cfg.get('time', '07:00')} (Asia/Taipei)`",
+                    f"  模式：`{cfg.get('mode', 'auto')}`",
+                    f"  目標 guild：`{cfg.get('guild_id') or '未設定'}`",
+                    f"  目標文字頻道：`{cfg.get('channel_id') or '未設定'}`",
+                    f"  目標語音頻道：`{cfg.get('voice_channel_id') or '未設定'}`",
+                    f"  上次執行：`{cfg.get('last_run_date') or '無'}`",
+                ]
+            )
+        )
+        return
+
+    if action == "off":
+        cfg["enabled"] = False
+        _save_morning_schedule(cfg)
+        await ctx.send("🛑 早朝排程已停用")
+        return
+
+    if action != "on":
+        await ctx.send("用法：`!morningcron [on|off|status] [HH:MM] [auto|stream|file] [voice_channel_id]`")
+        return
+
+    schedule_time = parts[1] if len(parts) >= 2 else str(cfg.get("time") or "07:00")
+    parsed = _parse_hhmm(schedule_time)
+    if not parsed:
+        await ctx.send("⚠️ 時間格式錯誤，請用 HH:MM（例：07:00）")
+        return
+
+    mode = parts[2].lower() if len(parts) >= 3 else str(cfg.get("mode") or "auto").lower()
+    if mode not in {OutputMode.AUTO, OutputMode.STREAM, OutputMode.FILE}:
+        await ctx.send("⚠️ mode 僅支援 auto / stream / file")
+        return
+
+    if not ctx.guild:
+        await ctx.send("⚠️ 請在伺服器文字頻道設定 morning 排程")
+        return
+
+    explicit_voice_channel_id = None
+    if len(parts) >= 4:
+        token = parts[3].strip()
+        digits = "".join(ch for ch in token if ch.isdigit())
+        if not digits:
+            await ctx.send("⚠️ voice_channel_id 格式錯誤，請輸入頻道 ID 或 <#channel>")
+            return
+        explicit_voice_channel_id = int(digits)
+
+    resolved_voice_channel_id = explicit_voice_channel_id
+    if mode == OutputMode.STREAM and resolved_voice_channel_id is None:
+        if ctx.author and getattr(ctx.author, "voice", None) and ctx.author.voice and ctx.author.voice.channel:
+            resolved_voice_channel_id = int(ctx.author.voice.channel.id)
+        elif cfg.get("voice_channel_id"):
+            resolved_voice_channel_id = int(cfg.get("voice_channel_id"))
         else:
-            await _synthesize_and_send_file(ctx, character, text, mood="沉穩", ambience="hall")
+            await ctx.send("⚠️ stream 模式需指定語音頻道：請加入語音後再下指令，或附上 voice_channel_id")
+            return
 
-    await ctx.send("✅ 早朝語音播報完畢")
+    if resolved_voice_channel_id is not None:
+        vc_obj = ctx.guild.get_channel(int(resolved_voice_channel_id))
+        if vc_obj is None or not isinstance(vc_obj, discord.VoiceChannel):
+            await ctx.send("⚠️ 指定的 voice_channel_id 不存在或不是語音頻道")
+            return
+
+    cfg.update(
+        {
+            "enabled": True,
+            "time": schedule_time,
+            "mode": mode,
+            "guild_id": int(ctx.guild.id),
+            "channel_id": int(ctx.channel.id),
+            "voice_channel_id": resolved_voice_channel_id,
+        }
+    )
+    _save_morning_schedule(cfg)
+
+    vc_line = f"\n🎧 語音頻道：{resolved_voice_channel_id}" if resolved_voice_channel_id else ""
+    await ctx.send(
+        f"✅ 早朝排程已啟用：每日 {schedule_time}（Asia/Taipei）\n"
+        f"📍 目標：{ctx.guild.name} / #{ctx.channel.name}\n"
+        f"🔊 模式：{mode}{vc_line}"
+    )
 
 
 @bot.command(name="greeting")
