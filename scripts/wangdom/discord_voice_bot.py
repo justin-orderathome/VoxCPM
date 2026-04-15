@@ -2006,6 +2006,16 @@ def _get_primary_guild() -> Optional[discord.Guild]:
     return bot.guilds[0] if bot.guilds else None
 
 
+def _resolve_guild(guild_id: Optional[str] = None) -> Optional[discord.Guild]:
+    """Resolve guild from ID string, fallback to primary guild."""
+    if guild_id:
+        gid = int(guild_id)
+        for g in bot.guilds:
+            if g.id == gid:
+                return g
+    return _get_primary_guild()
+
+
 def _validate_script_path(path_str: str) -> tuple[bool, str]:
     p = Path(path_str).resolve()
     for allowed in _ALLOWED_SCRIPT_DIRS:
@@ -2100,7 +2110,7 @@ async def _api_say(request):
             {"ok": False, "error": f"文字超過 {_MAX_TEXT_LEN} 字上限"}, status=400,
         )
 
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
     text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
@@ -2214,7 +2224,7 @@ async def _api_drama(request):
             {"ok": False, "error": f"劇本不存在：{script_path}"}, status=400,
         )
 
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
     text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
@@ -2319,7 +2329,7 @@ async def _api_stop(request):
         body = {}
 
     task_id = body.get("task_id", "")
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
 
@@ -2350,7 +2360,7 @@ async def _api_morning(request):
     voice_ch_id = body.get("voice_channel_id")
     request_id = body.get("request_id")
 
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
     text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
@@ -2399,7 +2409,7 @@ async def _api_greeting(request):
     voice_ch_id = body.get("voice_channel_id")
     request_id = body.get("request_id")
 
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
     text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
@@ -2462,7 +2472,7 @@ async def _api_weekly(request):
     if not source_path:
         return aioweb.json_response({"ok": False, "error": "缺少 source_path"}, status=400)
 
-    guild = _get_primary_guild()
+    guild = _resolve_guild(body.get("guild_id"))
     if not guild:
         return aioweb.json_response({"ok": False, "error": "Bot 不在任何伺服器"}, status=503)
     text_ch = bot.get_channel(int(text_ch_id)) if text_ch_id else None
