@@ -1191,6 +1191,29 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
+# 全域錯誤處理
+# ---------------------------------------------------------------------------
+@bot.event
+async def on_command_error(ctx, error):
+    """全域指令錯誤處理 — 避免異常靜默吞掉"""
+    if isinstance(error, commands.CommandNotFound):
+        # 只在 guild 頻道回覆，DM 不打擾
+        if ctx.guild:
+            await ctx.send(f"⚠️ 未知指令：`{ctx.invoked_with}`。輸入 `!status` 查看可用指令。")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"⚠️ 缺少參數：`{error.param.name}`")
+        return
+    # 其他錯誤
+    error_msg = f"❌ 指令執行異常：{type(error).__name__}: {error}"
+    print(f"[on_command_error] {error_msg}")
+    try:
+        await ctx.send(error_msg)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 指令
 # ---------------------------------------------------------------------------
 @bot.command(name="join")
@@ -1568,28 +1591,43 @@ async def cmd_morningcron(ctx, *, args: str = ""):
 
 @bot.command(name="greeting")
 async def cmd_greeting(ctx, *, args: str = ""):
+    if not ctx.guild:
+        await ctx.send("⚠️ 請在伺服器頻道中使用 !greeting")
+        return
     flags = _parse_mode_flags(args)
     mode = _router.resolve(ctx, flag_file=flags["file"], flag_stream=flags["stream"])
 
-    await ctx.send("🎀 節日問候整備中，正在載入天機報...")
-    report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
-    lines = _build_greeting_lines(report)
+    try:
+        await ctx.send("🎀 節日問候整備中，正在載入天機報...")
+        report = await asyncio.get_running_loop().run_in_executor(None, _load_tianji_report)
+        lines = _build_greeting_lines(report)
 
-    if report.get("error"):
-        await ctx.send(f"⚠️ 天機報載入異常：{report['error']}")
+        if report.get("error"):
+            await ctx.send(f"⚠️ 天機報載入異常：{report['error']}")
 
-    for character, text in lines:
-        if mode == OutputMode.STREAM:
-            await _synthesize_and_play_stream(ctx, character, text, mood="溫暖", ambience="hall")
-        else:
-            await _synthesize_and_send_file(ctx, character, text, mood="溫暖", ambience="hall")
+        for idx, (character, text) in enumerate(lines, 1):
+            await ctx.send(f"🎀 [{idx}/{len(lines)}] {character} 發言中…")
+            if mode == OutputMode.STREAM:
+                await _synthesize_and_play_stream(ctx, character, text, mood="溫暖", ambience="hall")
+            else:
+                await _synthesize_and_send_file(ctx, character, text, mood="溫暖", ambience="hall")
 
-    await ctx.send("✅ 節日問候播報完畢")
+        await ctx.send("✅ 節日問候播報完畢")
+    except Exception as e:
+        error_msg = f"❌ 節日問候異常：{type(e).__name__}: {e}"
+        print(error_msg)
+        try:
+            await ctx.send(error_msg)
+        except Exception:
+            pass
 
 
 @bot.command(name="drama")
 async def cmd_drama(ctx, *, args: str = ""):
     """多人廣播劇：!drama [-f|-s] <script_path>"""
+    if not ctx.guild:
+        await ctx.send("⚠️ 請在伺服器頻道中使用 !drama")
+        return
     if not args.strip():
         await ctx.send("用法：`!drama [-f|-s] <script_path>`")
         return
@@ -1610,72 +1648,80 @@ async def cmd_drama(ctx, *, args: str = ""):
 
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time() * 1000)
-    drama_wav = OUTPUT_DIR / f"drama_{ts}.wav"
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        drama_wav = OUTPUT_DIR / f"drama_{ts}.wav"
 
-    status_msg = await ctx.send("🎭 廣播劇生成中，請稍候...")
-    result = await asyncio.get_running_loop().run_in_executor(
-        None,
-        lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
-    )
-
-    if not result.get("ok"):
-        await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
-        return
-
-    summary = _build_drama_text_summary(result)
-    transcript_chunks = _build_drama_transcript_chunks(result)
-    transcript_timeline = result.get("transcript_timeline", []) or []
-
-    if mode == OutputMode.STREAM:
-        vc = await _ensure_voice_client(ctx)
-        if vc is None:
-            await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
-            return
-
-        if vc.is_playing():
-            vc.stop()
-
-        source = discord.FFmpegPCMAudio(
-            str(drama_wav),
-            options="-vn -f s16le -ar 48000 -ac 2",
-        )
-        vc.play(source)
-        await status_msg.edit(content="🔊 廣播劇已開始播放")
-        await ctx.send(summary)
-        if transcript_timeline:
-            await ctx.send("📝 **廣播劇文字同步（逐句）**")
-            first = transcript_timeline[0]
-            await ctx.send(f"**{first['speaker']}**：{first['text']}")
-            if len(transcript_timeline) > 1:
-                shifted = []
-                base = float(transcript_timeline[1].get("start_sec", 0.0))
-                for row in transcript_timeline[1:]:
-                    shifted.append({
-                        "speaker": row["speaker"],
-                        "text": row["text"],
-                        "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
-                    })
-                asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
-    else:
-        drama_mp3 = OUTPUT_DIR / f"drama_{ts}.mp3"
-        ok, err = await asyncio.get_running_loop().run_in_executor(
+        status_msg = await ctx.send("🎭 廣播劇生成中，請稍候...")
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: _convert_wav_to_mp3(str(drama_wav), str(drama_mp3)),
+            lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
         )
-        if not ok:
-            await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+
+        if not result.get("ok"):
+            await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
             return
 
-        await status_msg.edit(content="✅ 廣播劇已生成")
-        await ctx.send(summary)
-        for chunk in transcript_chunks:
-            await ctx.send(chunk)
-        await ctx.send(
-            "📎 廣播劇語音檔",
-            file=discord.File(str(drama_mp3), filename=drama_mp3.name),
-        )
+        summary = _build_drama_text_summary(result)
+        transcript_chunks = _build_drama_transcript_chunks(result)
+        transcript_timeline = result.get("transcript_timeline", []) or []
+
+        if mode == OutputMode.STREAM:
+            vc = await _ensure_voice_client(ctx)
+            if vc is None:
+                await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
+                return
+
+            if vc.is_playing():
+                vc.stop()
+
+            source = discord.FFmpegPCMAudio(
+                str(drama_wav),
+                options="-vn -f s16le -ar 48000 -ac 2",
+            )
+            vc.play(source)
+            await status_msg.edit(content="🔊 廣播劇已開始播放")
+            await ctx.send(summary)
+            if transcript_timeline:
+                await ctx.send("📝 **廣播劇文字同步（逐句）**")
+                first = transcript_timeline[0]
+                await ctx.send(f"**{first['speaker']}**：{first['text']}")
+                if len(transcript_timeline) > 1:
+                    shifted = []
+                    base = float(transcript_timeline[1].get("start_sec", 0.0))
+                    for row in transcript_timeline[1:]:
+                        shifted.append({
+                            "speaker": row["speaker"],
+                            "text": row["text"],
+                            "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
+                        })
+                    asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+        else:
+            drama_mp3 = OUTPUT_DIR / f"drama_{ts}.mp3"
+            ok, err = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _convert_wav_to_mp3(str(drama_wav), str(drama_mp3)),
+            )
+            if not ok:
+                await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+                return
+
+            await status_msg.edit(content="✅ 廣播劇已生成")
+            await ctx.send(summary)
+            for chunk in transcript_chunks:
+                await ctx.send(chunk)
+            await ctx.send(
+                "📎 廣播劇語音檔",
+                file=discord.File(str(drama_mp3), filename=drama_mp3.name),
+            )
+    except Exception as e:
+        error_msg = f"❌ 廣播劇異常：{type(e).__name__}: {e}"
+        print(error_msg)
+        try:
+            await ctx.send(error_msg)
+        except Exception:
+            pass
 
 
 def _split_weekly_paragraphs(text: str) -> list[str]:
@@ -1797,6 +1843,9 @@ def _render_weekly_audio(report_text: str, output_wav: str, source_path: str) ->
 @bot.command(name="weekly")
 async def cmd_weekly(ctx, *, args: str = ""):
     """有聲週報：!weekly [-f|-s] <weekly_txt_path>"""
+    if not ctx.guild:
+        await ctx.send("⚠️ 請在伺服器頻道中使用 !weekly")
+        return
     if not args.strip():
         await ctx.send("用法：`!weekly [-f|-s] <weekly_txt_path>`")
         return
@@ -1822,68 +1871,76 @@ async def cmd_weekly(ctx, *, args: str = ""):
 
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    ts = int(time.time() * 1000)
-    weekly_wav = OUTPUT_DIR / f"weekly_{ts}.wav"
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        ts = int(time.time() * 1000)
+        weekly_wav = OUTPUT_DIR / f"weekly_{ts}.wav"
 
-    status_msg = await ctx.send("🗞️ 週報生成中，請稍候...")
-    result = await asyncio.get_running_loop().run_in_executor(
-        None,
-        lambda: _render_weekly_audio(report_text, str(weekly_wav), str(report_file)),
-    )
-
-    if not result.get("ok"):
-        await status_msg.edit(content=f"❌ 週報生成失敗：{result.get('reason', '未知錯誤')}")
-        return
-
-    summary = _build_weekly_summary(result)
-    transcript_chunks = _build_weekly_transcript_chunks(result)
-    transcript_timeline = result.get("transcript_timeline", []) or []
-
-    if mode == OutputMode.STREAM:
-        vc = await _ensure_voice_client(ctx)
-        if vc is None:
-            await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
-            return
-        if vc.is_playing():
-            vc.stop()
-
-        source = discord.FFmpegPCMAudio(
-            str(weekly_wav),
-            options="-vn -f s16le -ar 48000 -ac 2",
-        )
-        vc.play(source)
-        await status_msg.edit(content="🔊 有聲週報已開始播放")
-        await ctx.send(summary)
-        if transcript_timeline:
-            await ctx.send("📝 **週報文字同步（逐句）**")
-            first = transcript_timeline[0]
-            await ctx.send(f"**{first['speaker']}**：{first['text']}")
-            if len(transcript_timeline) > 1:
-                shifted = []
-                base = float(transcript_timeline[1].get("start_sec", 0.0))
-                for row in transcript_timeline[1:]:
-                    shifted.append({
-                        "speaker": row["speaker"],
-                        "text": row["text"],
-                        "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
-                    })
-                asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
-    else:
-        weekly_mp3 = OUTPUT_DIR / f"weekly_{ts}.mp3"
-        ok, err = await asyncio.get_running_loop().run_in_executor(
+        status_msg = await ctx.send("🗞️ 週報生成中，請稍候...")
+        result = await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: _convert_wav_to_mp3(str(weekly_wav), str(weekly_mp3)),
+            lambda: _render_weekly_audio(report_text, str(weekly_wav), str(report_file)),
         )
-        if not ok:
-            await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+
+        if not result.get("ok"):
+            await status_msg.edit(content=f"❌ 週報生成失敗：{result.get('reason', '未知錯誤')}")
             return
 
-        await status_msg.edit(content="✅ 有聲週報已生成")
-        await ctx.send(summary)
-        for chunk in transcript_chunks:
-            await ctx.send(chunk)
-        await ctx.send("📎 有聲週報語音檔", file=discord.File(str(weekly_mp3), filename=weekly_mp3.name))
+        summary = _build_weekly_summary(result)
+        transcript_chunks = _build_weekly_transcript_chunks(result)
+        transcript_timeline = result.get("transcript_timeline", []) or []
+
+        if mode == OutputMode.STREAM:
+            vc = await _ensure_voice_client(ctx)
+            if vc is None:
+                await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
+                return
+            if vc.is_playing():
+                vc.stop()
+
+            source = discord.FFmpegPCMAudio(
+                str(weekly_wav),
+                options="-vn -f s16le -ar 48000 -ac 2",
+            )
+            vc.play(source)
+            await status_msg.edit(content="🔊 有聲週報已開始播放")
+            await ctx.send(summary)
+            if transcript_timeline:
+                await ctx.send("📝 **週報文字同步（逐句）**")
+                first = transcript_timeline[0]
+                await ctx.send(f"**{first['speaker']}**：{first['text']}")
+                if len(transcript_timeline) > 1:
+                    shifted = []
+                    base = float(transcript_timeline[1].get("start_sec", 0.0))
+                    for row in transcript_timeline[1:]:
+                        shifted.append({
+                            "speaker": row["speaker"],
+                            "text": row["text"],
+                            "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
+                        })
+                    asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+        else:
+            weekly_mp3 = OUTPUT_DIR / f"weekly_{ts}.mp3"
+            ok, err = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _convert_wav_to_mp3(str(weekly_wav), str(weekly_mp3)),
+            )
+            if not ok:
+                await status_msg.edit(content=f"❌ MP3 轉檔失敗：{err}")
+                return
+
+            await status_msg.edit(content="✅ 有聲週報已生成")
+            await ctx.send(summary)
+            for chunk in transcript_chunks:
+                await ctx.send(chunk)
+            await ctx.send("📎 有聲週報語音檔", file=discord.File(str(weekly_mp3), filename=weekly_mp3.name))
+    except Exception as e:
+        error_msg = f"❌ 有聲週報異常：{type(e).__name__}: {e}"
+        print(error_msg)
+        try:
+            await ctx.send(error_msg)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

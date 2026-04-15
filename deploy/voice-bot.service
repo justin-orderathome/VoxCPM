@@ -2,6 +2,8 @@
 Description=Wangdom VoxCPM Discord Voice Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=20
 
 [Service]
 Type=simple
@@ -10,6 +12,7 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/home/hermes01/projects/VoxCPM/venv/bin/python /home/hermes01/projects/VoxCPM/scripts/wangdom/discord_voice_bot.py
 Restart=always
 RestartSec=5
+TimeoutStopSec=20
 StandardOutput=append:/home/hermes01/projects/VoxCPM/output/voice-bot.log
 StandardError=append:/home/hermes01/projects/VoxCPM/output/voice-bot.log
 
