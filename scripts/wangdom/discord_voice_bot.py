@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import itertools
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -89,6 +91,172 @@ ROLE_EMOJI = {
     "使君·劉備": "🍑",
     "司天監·李淳風": "🔮",
 }
+
+DRAMA_VAULT_ROOT = Path.home() / "projects" / "second-brain-clerk" / "wiki" / "崴勝王朝" / "趣聞閣"
+SPEAKER_ALIAS = {
+    "主公": "主公·劉邦",
+    "諸葛亮": "軍師·諸葛亮",
+    "曾國藩": "丞相·曾國藩",
+    "魏徵": "御史·魏徵",
+    "紀曉嵐": "禮部·紀曉嵐",
+    "戚繼光": "兵部·戚繼光",
+    "李冰": "工部·李冰",
+    "唐伯虎": "待詔·唐伯虎",
+    "韓信": "將軍·韓信",
+    "劉備": "使君·劉備",
+    "李淳風": "司天監·李淳風",
+}
+
+
+def _normalize_speaker_name(raw: str) -> str:
+    name = raw.strip()
+    name = re.sub(r"^[^\w\u4e00-\u9fff]+\s*", "", name)
+    name = name.replace("·", "·")
+    if name in ROLE_EMOJI:
+        return name
+    if name in SPEAKER_ALIAS:
+        return SPEAKER_ALIAS[name]
+    for full in ROLE_EMOJI.keys():
+        short = full.split("·", 1)[-1]
+        if name == short:
+            return full
+    return name
+
+
+def _parse_reading_markdown_segments(reading_path: Path) -> tuple[list[dict], list[str]]:
+    lines = reading_path.read_text(encoding="utf-8").splitlines()
+    header_re = re.compile(r"^\s*(?:\S+\s+)?([^：（:]+?)\s*(?:（([^）]*)）)?\s*[:：]\s*$")
+    stage_re = re.compile(r"^\s*[（(].*[）)]\s*$")
+    act_re = re.compile(r"^\s*【第.+幕[:：].+】\s*$")
+
+    in_drama = False
+    current = None
+    segments: list[dict] = []
+    errors: list[str] = []
+
+    for idx, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if line.startswith("## 劇本"):
+            in_drama = True
+            continue
+        if not in_drama:
+            continue
+        if not line or line == "---" or stage_re.match(line) or act_re.match(line) or line.startswith(">"):
+            if current and line in {"", "---"}:
+                text = " ".join(current["buf"]).strip()
+                if text:
+                    current["text"] = text
+                    segments.append(current)
+                else:
+                    errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
+                current = None
+            continue
+
+        m = header_re.match(line)
+        if m:
+            if current:
+                text = " ".join(current["buf"]).strip()
+                if text:
+                    current["text"] = text
+                    segments.append(current)
+                else:
+                    errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
+            speaker = _normalize_speaker_name(m.group(1))
+            note = (m.group(2) or "").strip()
+            current = {
+                "line": idx,
+                "speaker": speaker,
+                "mood": None,
+                "expression_tags": [note] if note else [],
+                "pause_after": 0.5,
+                "buf": [],
+            }
+            continue
+
+        if current:
+            current["buf"].append(line)
+
+    if current:
+        text = " ".join(current["buf"]).strip()
+        if text:
+            current["text"] = text
+            segments.append(current)
+        else:
+            errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
+
+    norm_segments = []
+    for i, seg in enumerate(segments, start=1):
+        norm_segments.append(
+            {
+                "id": i,
+                "speaker": seg["speaker"],
+                "text": seg["text"],
+                "mood": seg.get("mood"),
+                "expression_tags": seg.get("expression_tags", []),
+                "timing": {"pause_after": seg.get("pause_after", 0.5), "start_sec": None, "duration_sec": None},
+                "voice": {"profile": seg["speaker"], "ambience": "none", "sample_rate": 48000},
+                "subtitle": {"text": seg["text"], "lead_time_ms": 0, "display_mode": "timed"},
+            }
+        )
+    return norm_segments, errors
+
+
+def _compile_reading_to_json(reading_path: Path, json_path: Path) -> tuple[bool, str]:
+    try:
+        segments, errors = _parse_reading_markdown_segments(reading_path)
+        if errors:
+            return False, "；".join(errors[:5])
+        if not segments:
+            return False, "未解析到任何對話段（請檢查閱讀版格式）"
+        payload = {
+            "schema_version": "drama-script/v1",
+            "title": reading_path.parent.name,
+            "date": datetime.now(TW_TZ).strftime("%Y-%m-%d"),
+            "source": {
+                "reading_file": str(reading_path.name),
+                "generated_at": datetime.now(TW_TZ).isoformat(),
+            },
+            "segments_total": len(segments),
+            "segments": segments,
+        }
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _resolve_drama_script_input(script_arg: str) -> tuple[Optional[Path], str]:
+    raw = script_arg.strip()
+    if not raw:
+        return None, "請提供劇本檔案路徑或館藏資料夾名稱"
+
+    direct = Path(raw).expanduser()
+    if direct.exists():
+        return direct.resolve(), ""
+
+    is_folder_hint = ("/" not in raw and "\\" not in raw)
+    if is_folder_hint:
+        folder = DRAMA_VAULT_ROOT / raw
+        if not folder.exists() or not folder.is_dir():
+            candidates = [p.name for p in DRAMA_VAULT_ROOT.iterdir() if p.is_dir()] if DRAMA_VAULT_ROOT.exists() else []
+            guessed = difflib.get_close_matches(raw, candidates, n=3, cutoff=0.3)
+            hint = f"；你是不是想輸入：{', '.join(guessed)}" if guessed else ""
+            return None, f"查無館藏資料夾：{raw}{hint}"
+
+        json_path = folder / "語音版.json"
+        if json_path.exists():
+            return json_path, ""
+
+        reading_path = folder / "閱讀版.md"
+        if reading_path.exists():
+            ok, err = _compile_reading_to_json(reading_path, json_path)
+            if ok:
+                return json_path, ""
+            return None, f"自動編譯語音版.json失敗：{err}"
+
+        return None, f"資料夾缺少語音版.json與閱讀版.md：{folder}"
+
+    return None, f"劇本檔案不存在：{raw}"
 
 
 def _fmt_line(text: str, speaker: str) -> str:
@@ -949,17 +1117,75 @@ def _convert_wav_to_mp3(wav_path: str, mp3_path: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _render_drama_audio(script_path: str, output_wav: str, max_segments: int = 30) -> dict:
+_VRAM_THRESHOLD_GB = 10.5  # 12GB - 1.5GB 安全邊際
+
+
+def _render_drama_audio(
+    script_path: str,
+    output_wav: str,
+    max_segments: int = None,
+    progress: dict | None = None,
+    checkpoint_dir: str | None = None,
+) -> dict:
+    """渲染多人廣播劇為單一 WAV。
+
+    Args:
+        script_path: 劇本檔案路徑
+        output_wav: 輸出 WAV 路徑
+        max_segments: 段數上限（None = 不限）
+        progress: 共享 dict 供外部輪詢進度 {"done", "total", "current_speaker", "vram_gb"}
+        checkpoint_dir: 斷點續傳目錄（None = 不啟用）
+    """
+    import gc
+    import torch
+
     parser = DialogueParser()
-    segments = parser.parse_file(script_path)
+    script_file = Path(script_path)
+    if script_file.suffix.lower() == ".json":
+        try:
+            payload = json.loads(script_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            return {"ok": False, "reason": f"語音版.json 解析失敗：{e}"}
+        raw_segments = payload.get("segments", [])
+        if not isinstance(raw_segments, list):
+            return {"ok": False, "reason": "語音版.json 缺少 segments[]"}
+        segments = []
+        for row in raw_segments:
+            if not isinstance(row, dict):
+                continue
+            speaker = str(row.get("speaker", "")).strip()
+            text = str(row.get("text", "")).strip()
+            if not speaker or not text:
+                continue
+            timing = row.get("timing", {}) or {}
+            segments.append(
+                {
+                    "speaker": speaker,
+                    "text": text,
+                    "mood": row.get("mood"),
+                    "expression_tags": row.get("expression_tags") or None,
+                    "pause_after": float(timing.get("pause_after", 0.5) or 0.5),
+                }
+            )
+    else:
+        segments = [
+            {
+                "speaker": s.speaker,
+                "text": s.text,
+                "mood": s.mood,
+                "expression_tags": s.expression_tags,
+                "pause_after": float(getattr(s, "pause_after", 0.5) or 0.5),
+            }
+            for s in parser.parse_file(script_path)
+        ]
 
     if not segments:
         return {"ok": False, "reason": "劇本沒有可解析段落"}
-    if len(segments) > max_segments:
+    if max_segments is not None and len(segments) > max_segments:
         return {"ok": False, "reason": f"段數超限（{len(segments)} > {max_segments}）"}
 
     profiles = _engine.profile_manager._profiles
-    unknown = sorted({seg.speaker for seg in segments if seg.speaker not in profiles})
+    unknown = sorted({seg["speaker"] for seg in segments if seg["speaker"] not in profiles})
     if unknown:
         return {"ok": False, "reason": f"角色未定義：{', '.join(unknown)}"}
 
@@ -969,18 +1195,62 @@ def _render_drama_audio(script_path: str, output_wav: str, max_segments: int = 3
     transcript_lines: list[dict] = []
     transcript_timeline: list[dict] = []
     cursor_sec = 0.0
+    _cp_dir = Path(checkpoint_dir) if checkpoint_dir else None
 
     with tempfile.TemporaryDirectory(prefix="wangdom_drama_") as td:
         for i, seg in enumerate(segments):
+            # --- 斷點續傳：跳過已完成的段 ---
+            if _cp_dir is not None:
+                done_path = _cp_dir / f"seg_{i:04d}.wav"
+                if done_path.exists():
+                    try:
+                        audio = sf.read(str(done_path), dtype="float32")
+                        if audio.ndim == 2:
+                            audio = audio.mean(axis=1)
+                        if int(sf.info(str(done_path)).samplerate) != int(sr_target):
+                            audio = _resample_audio(audio, int(sf.info(str(done_path)).samplerate), int(sr_target))
+                        audio = normalize_rms(audio, target_rms=0.08)
+                        seg_duration = len(audio) / float(sr_target)
+                        audios.append(audio.astype(np.float32))
+                        pause_sec = float(seg.get("pause_after", 0.5) or 0.5)
+                        if i < len(segments) - 1 and pause_sec > 0:
+                            audios.append(np.zeros(int(sr_target * pause_sec), dtype=np.float32))
+                        if len(preview) < 3:
+                            t = seg["text"].replace("\n", " ").strip()
+                            preview.append({"speaker": seg["speaker"], "text": (t[:42] + "…") if len(t) > 42 else t})
+                        transcript_lines.append({"speaker": seg["speaker"], "text": seg["text"].replace("\n", " ").strip()})
+                        transcript_timeline.append({"speaker": seg["speaker"], "text": seg["text"].replace("\n", " ").strip(), "start_sec": round(cursor_sec, 3), "duration_sec": round(seg_duration, 3)})
+                        cursor_sec += seg_duration + (pause_sec if i < len(segments) - 1 and pause_sec > 0 else 0.0)
+                        print(f"[drama] 跳過已緩存段 {i+1}/{len(segments)} — {seg['speaker']}")
+                        if progress is not None:
+                            progress["done"] = i + 1
+                            progress["total"] = len(segments)
+                            progress["current_speaker"] = seg["speaker"]
+                        continue
+                    except Exception as e:
+                        print(f"[drama] 讀取 checkpoint seg_{i:04d} 失敗: {e}，重新生成")
+
+            # --- 正常生成 ---
             seg_path = Path(td) / f"seg_{i:04d}.wav"
-            res = _engine.synthesize_file(
-                text=seg.text,
-                character=seg.speaker,
-                output_path=seg_path,
-                mood=seg.mood,
-                ambience="none",
-                output_format="wav",
-            )
+            t0 = time.monotonic()
+            print(f"[drama] >>> synth start seg {i+1}/{len(segments)} {seg['speaker']}")
+            try:
+                res = _engine.synthesize_file(
+                    text=seg["text"],
+                    character=seg["speaker"],
+                    output_path=seg_path,
+                    mood=seg.get("mood"),
+                    ambience="none",
+                    output_format="wav",
+                )
+            except Exception as synth_err:
+                import traceback
+                elapsed = time.monotonic() - t0
+                print(f"[drama] <<< synth EXCEPTION seg {i+1} after {elapsed:.1f}s: "
+                      f"{type(synth_err).__name__}: {synth_err}\n{traceback.format_exc()}")
+                return {"ok": False, "reason": f"第{i+1}段異常：{type(synth_err).__name__}: {synth_err}"}
+            elapsed = time.monotonic() - t0
+            print(f"[drama] <<< synth done seg {i+1} {elapsed:.1f}s fallback={res.get('fallback_from','')}")
             if not res.get("ok"):
                 return {"ok": False, "reason": f"第{i+1}段生成失敗：{res.get('reason', 'unknown')}"}
 
@@ -993,28 +1263,91 @@ def _render_drama_audio(script_path: str, output_wav: str, max_segments: int = 3
             seg_duration = len(audio) / float(sr_target)
             audios.append(audio.astype(np.float32))
 
-            pause_sec = float(getattr(seg, "pause_after", 0.5) or 0.5)
+            pause_sec = float(seg.get("pause_after", 0.5) or 0.5)
             if i < len(segments) - 1 and pause_sec > 0:
                 audios.append(np.zeros(int(sr_target * pause_sec), dtype=np.float32))
 
             if len(preview) < 3:
-                t = seg.text.replace("\n", " ").strip()
-                preview.append({"speaker": seg.speaker, "text": (t[:42] + "…") if len(t) > 42 else t})
+                t = seg["text"].replace("\n", " ").strip()
+                preview.append({"speaker": seg["speaker"], "text": (t[:42] + "…") if len(t) > 42 else t})
 
             transcript_lines.append({
-                "speaker": seg.speaker,
-                "text": seg.text.replace("\n", " ").strip(),
+                "speaker": seg["speaker"],
+                "text": seg["text"].replace("\n", " ").strip(),
             })
             transcript_timeline.append({
-                "speaker": seg.speaker,
-                "text": seg.text.replace("\n", " ").strip(),
+                "speaker": seg["speaker"],
+                "text": seg["text"].replace("\n", " ").strip(),
                 "start_sec": round(cursor_sec, 3),
                 "duration_sec": round(seg_duration, 3),
             })
             cursor_sec += seg_duration + (pause_sec if i < len(segments) - 1 and pause_sec > 0 else 0.0)
 
+            # --- 防線一：每段後主動釋放 CUDA cache ---
+            try:
+                torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+
+            # --- 防線二：VRAM 觀測 + 進度回報 ---
+            vram_gb = 0.0
+            vram_reserved = 0.0
+            vram_nvidia = ""
+            try:
+                vram_gb = round(torch.cuda.memory_allocated() / (1024**3), 2)
+                vram_reserved = round(torch.cuda.memory_reserved() / (1024**3), 2)
+            except Exception:
+                pass
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if r.returncode == 0:
+                    vram_nvidia = f"{int(r.stdout.strip())} MB"
+            except Exception:
+                pass
+
+            if progress is not None:
+                progress["done"] = i + 1
+                progress["total"] = len(segments)
+                progress["current_speaker"] = seg["speaker"]
+                progress["vram_gb"] = round(int(vram_nvidia.split()[0]) / 1024, 2) if vram_nvidia else vram_gb
+
+            print(f"[drama] {i+1}/{len(segments)} {seg['speaker']} | "
+                  f"alloc={vram_gb} reserved={vram_reserved} nvidia={vram_nvidia} | "
+                  f"seg_dur={seg_duration:.2f}s cursor={cursor_sec:.1f}s")
+
+            # --- 保存 checkpoint ---
+            if _cp_dir is not None:
+                _cp_dir.mkdir(parents=True, exist_ok=True)
+                sf.write(str(_cp_dir / f"seg_{i:04d}.wav"), audio.astype(np.float32), sr_target)
+
+            # --- 防線三：VRAM 閾值觸發斷點續傳 ---
+            if vram_gb > _VRAM_THRESHOLD_GB:
+                print(f"[drama] ⚠️ VRAM {vram_gb} GB 超閾值 {_VRAM_THRESHOLD_GB} GB，"
+                      f"已保存 {i+1}/{len(segments)} 段")
+                return {
+                    "ok": False,
+                    "reason": f"VRAM 超閾值（{vram_gb} GB > {_VRAM_THRESHOLD_GB} GB）",
+                    "checkpoint": {
+                        "done": i + 1,
+                        "total": len(segments),
+                        "checkpoint_dir": str(_cp_dir),
+                        "can_resume": True,
+                    },
+                    "segments_done": i + 1,
+                }
+
     merged = np.concatenate(audios) if audios else np.zeros(1, dtype=np.float32)
     sf.write(output_wav, merged, sr_target)
+
+    # 清理 checkpoint（正常完成）
+    if _cp_dir is not None and _cp_dir.exists():
+        import shutil
+        shutil.rmtree(str(_cp_dir), ignore_errors=True)
+        print(f"[drama] checkpoint 已清理：{_cp_dir}")
 
     return {
         "ok": True,
@@ -1670,27 +2003,35 @@ async def cmd_greeting(ctx, *, args: str = ""):
 
 @bot.command(name="drama")
 async def cmd_drama(ctx, *, args: str = ""):
-    """多人廣播劇：!drama [-f|-s] <script_path>"""
+    """多人廣播劇：!drama [-f|-s] [--resume <checkpoint_dir>] <script_path|folder_name>"""
     if not ctx.guild:
         await ctx.send("⚠️ 請在伺服器頻道中使用 !drama")
         return
     if not args.strip():
-        await ctx.send("用法：`!drama [-f|-s] <script_path>`")
+        await ctx.send("用法：`!drama [-f|-s] [--resume <dir>] <script_path|館藏資料夾名>`")
         return
 
     parts = args.strip().split()
     flag_file = "-f" in parts
     flag_stream = "-s" in parts
-    script_path = " ".join(p for p in parts if p not in {"-f", "-s"}).strip()
+    flag_resume = "--resume" in parts
+    resume_dir = ""
+    if flag_resume:
+        idx = parts.index("--resume")
+        if idx + 1 < len(parts) and not parts[idx + 1].startswith("-"):
+            resume_dir = parts[idx + 1]
+    script_path = " ".join(p for p in parts if p not in {"-f", "-s", "--resume"} and p != resume_dir).strip()
 
     if not script_path:
-        await ctx.send("⚠️ 請提供劇本檔案路徑")
+        await ctx.send("⚠️ 請提供劇本檔案路徑或館藏資料夾名稱")
         return
 
-    script_file = Path(script_path)
-    if not script_file.exists():
-        await ctx.send(f"⚠️ 劇本檔案不存在：`{script_path}`")
+    resolved_script_file, resolve_err = _resolve_drama_script_input(script_path)
+    if not resolved_script_file:
+        await ctx.send(f"⚠️ {resolve_err}")
         return
+
+    script_file = resolved_script_file
 
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
@@ -1699,14 +2040,55 @@ async def cmd_drama(ctx, *, args: str = ""):
         ts = int(time.time() * 1000)
         drama_wav = OUTPUT_DIR / f"drama_{ts}.wav"
 
+        # 斷點續傳目錄
+        checkpoint_dir = resume_dir if resume_dir else str(OUTPUT_DIR / f"checkpoint_{ts:010d}")
+        if flag_resume and not resume_dir:
+            # 嘗試找最近的 checkpoint
+            cp_dirs = sorted(OUTPUT_DIR.glob("checkpoint_*"), key=os.path.getmtime, reverse=True)
+            if cp_dirs:
+                checkpoint_dir = str(cp_dirs[0])
+
+        progress = {"done": 0, "total": 0, "current_speaker": "", "vram_gb": 0.0}
+
+        async def _poll_progress():
+            """定期更新 Discord status message"""
+            while progress.get("done", 0) < progress.get("total", 1) or progress.get("total", 0) == 0:
+                await asyncio.sleep(5)
+                d, t, s, v = progress["done"], progress["total"], progress["current_speaker"], progress.get("vram_gb", 0)
+                try:
+                    if t > 0:
+                        await status_msg.edit(
+                            content=f"🎭 生成中 {d}/{t}（{s}）| VRAM {v} GB"
+                        )
+                    else:
+                        await status_msg.edit(content="🎭 廣播劇解析中...")
+                except Exception:
+                    break
+
         status_msg = await ctx.send("🎭 廣播劇生成中，請稍候...")
-        result = await asyncio.get_running_loop().run_in_executor(
-            None,
-            lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
-        )
+        poll_task = asyncio.create_task(_poll_progress())
+        try:
+            result = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: _render_drama_audio(
+                    str(script_file), str(drama_wav),
+                    progress=progress, checkpoint_dir=checkpoint_dir,
+                ),
+            )
+        finally:
+            poll_task.cancel()
 
         if not result.get("ok"):
-            await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
+            # 斷點續傳：VRAM 超閾值
+            cp = result.get("checkpoint")
+            if cp and cp.get("can_resume"):
+                await status_msg.edit(
+                    content=f"⚠️ VRAM 接近上限，已保存 {cp['done']}/{cp['total']} 段\n"
+                            f"請稍後用 `!drama --resume {script_path}` 續傳。\n"
+                            f"（已完成段已緩存，不會重新生成）"
+                )
+            else:
+                await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
             return
 
         summary = _build_drama_text_summary(result)
@@ -2277,18 +2659,47 @@ async def _api_drama(request):
             ts = int(time.time() * 1000)
             drama_wav = OUTPUT_DIR / f"drama_api_{ts}.wav"
 
-            result = await asyncio.get_running_loop().run_in_executor(
-                None,
-                lambda: _render_drama_audio(str(script_file), str(drama_wav), max_segments=30),
-            )
+            # 進度回報 + 斷點續傳
+            checkpoint_dir = str(OUTPUT_DIR / f"checkpoint_api_{ts:010d}")
+            progress = {"done": 0, "total": 0, "current_speaker": "", "vram_gb": 0.0}
+
+            async def _poll_api_progress():
+                while progress.get("done", 0) < progress.get("total", 1) or progress.get("total", 0) == 0:
+                    await asyncio.sleep(3)
+                    d, t, v = progress["done"], progress["total"], progress.get("vram_gb", 0)
+                    if t > 0:
+                        rec.progress = f"{d}/{t} | VRAM {v} GB"
+
+            poll_task = asyncio.create_task(_poll_api_progress())
+            try:
+                result = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _render_drama_audio(
+                        str(script_file), str(drama_wav),
+                        progress=progress, checkpoint_dir=checkpoint_dir,
+                    ),
+                )
+            finally:
+                poll_task.cancel()
 
             if not result.get("ok"):
-                rec.status = "failed"
-                rec.error = result.get("reason", "渲染失敗")
+                # 斷點續傳處理
+                cp = result.get("checkpoint")
+                if cp and cp.get("can_resume"):
+                    rec.status = "paused"
+                    rec.error = f"VRAM 超閾值，已保存 {cp['done']}/{cp['total']} 段"
+                    rec.progress = f"{cp['done']}/{cp['total']} | paused"
+                    await ctx.send(
+                        f"⚠️ VRAM 接近上限，已保存 {cp['done']}/{cp['total']} 段\n"
+                        f"請重啟語音服務後帶 resume 參數重新請求。"
+                    )
+                else:
+                    rec.status = "failed"
+                    rec.error = result.get("reason", "渲染失敗")
                 rec.finished_at = datetime.now(TW_TZ).isoformat()
                 return
 
-            seg_count = result.get("total_segments", 0)
+            seg_count = result.get("segments", 0)
             rec.progress = f"{seg_count}/{seg_count}"
             rec.duration_sec = result.get("duration_sec")
             t_lines = result.get("transcript_lines", [])
@@ -2335,6 +2746,10 @@ async def _api_drama(request):
                     return
                 rec.output_path = str(drama_mp3)
                 await ctx.send(summary)
+                # 補上文字同步（議題 A 修補）
+                transcript_chunks = _build_drama_transcript_chunks(result)
+                for chunk in transcript_chunks:
+                    await ctx.send(chunk)
 
             rec.status = "done"
             rec.finished_at = datetime.now(TW_TZ).isoformat()

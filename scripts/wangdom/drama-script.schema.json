@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wangdom.local/schemas/drama-script.schema.json",
+  "title": "Wangdom Drama Script v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "title",
+    "source",
+    "segments_total",
+    "segments"
+  ],
+  "properties": {
+    "schema_version": { "const": "drama-script/v1" },
+    "title": { "type": "string", "minLength": 1 },
+    "date": { "type": "string" },
+    "source": {
+      "type": "object",
+      "required": ["reading_file", "generated_at"],
+      "properties": {
+        "reading_file": { "type": "string" },
+        "generated_at": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "segments_total": { "type": "integer", "minimum": 1 },
+    "segments": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "speaker", "text"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "speaker": { "type": "string", "minLength": 1 },
+          "text": { "type": "string", "minLength": 1 },
+          "mood": { "type": ["string", "null"] },
+          "expression_tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "voice": {
+            "type": "object",
+            "properties": {
+              "profile": { "type": "string" },
+              "ambience": { "type": "string" },
+              "sample_rate": { "type": "integer" }
+            },
+            "additionalProperties": true
+          },
+          "subtitle": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" },
+              "lead_time_ms": { "type": "integer" },
+              "display_mode": { "type": "string" }
+            },
+            "additionalProperties": true
+          },
+          "timing": {
+            "type": "object",
+            "properties": {
+              "pause_after": { "type": "number" },
+              "start_sec": { "type": ["number", "null"] },
+              "duration_sec": { "type": ["number", "null"] }
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
