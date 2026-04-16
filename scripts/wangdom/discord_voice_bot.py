@@ -105,6 +105,9 @@ SPEAKER_ALIAS = {
     "韓信": "將軍·韓信",
     "劉備": "使君·劉備",
     "李淳風": "司天監·李淳風",
+    "全場": "司天監·李淳風",
+    "群臣": "司天監·李淳風",
+    "眾人": "司天監·李淳風",
 }
 
 
@@ -1186,14 +1189,19 @@ def _render_drama_audio(
 
     profiles = _engine.profile_manager._profiles
     unknown = sorted({seg["speaker"] for seg in segments if seg["speaker"] not in profiles})
+    fallback_voice = "待詔·唐伯虎"
+    if fallback_voice not in profiles:
+        return {"ok": False, "reason": f"fallback 角色未定義：{fallback_voice}"}
     if unknown:
-        return {"ok": False, "reason": f"角色未定義：{', '.join(unknown)}"}
+        print(f"[drama] ⚠️ 未定義角色將 fallback 至 {fallback_voice}: {', '.join(unknown)}")
 
     sr_target = _engine.out_sample_rate
     audios: list[np.ndarray] = []
     preview: list[dict] = []
     transcript_lines: list[dict] = []
     transcript_timeline: list[dict] = []
+    fallback_segments = 0
+    fallback_speakers_used: set[str] = set()
     cursor_sec = 0.0
     _cp_dir = Path(checkpoint_dir) if checkpoint_dir else None
 
@@ -1233,11 +1241,16 @@ def _render_drama_audio(
             # --- 正常生成 ---
             seg_path = Path(td) / f"seg_{i:04d}.wav"
             t0 = time.monotonic()
-            print(f"[drama] >>> synth start seg {i+1}/{len(segments)} {seg['speaker']}")
+            voice_speaker = seg["speaker"] if seg["speaker"] in profiles else fallback_voice
+            if voice_speaker != seg["speaker"]:
+                fallback_segments += 1
+                fallback_speakers_used.add(seg["speaker"])
+                print(f"[drama] fallback voice: {seg['speaker']} -> {voice_speaker} (seg {i+1}/{len(segments)})")
+            print(f"[drama] >>> synth start seg {i+1}/{len(segments)} {seg['speaker']} (voice={voice_speaker})")
             try:
                 res = _engine.synthesize_file(
                     text=seg["text"],
-                    character=seg["speaker"],
+                    character=voice_speaker,
                     output_path=seg_path,
                     mood=seg.get("mood"),
                     ambience="none",
@@ -1358,6 +1371,9 @@ def _render_drama_audio(
         "preview": preview,
         "transcript_lines": transcript_lines,
         "transcript_timeline": transcript_timeline,
+        "fallback_voice_profile": fallback_voice,
+        "fallback_segments": fallback_segments,
+        "fallback_speakers": sorted(fallback_speakers_used),
     }
 
 
@@ -2094,6 +2110,9 @@ async def cmd_drama(ctx, *, args: str = ""):
         summary = _build_drama_text_summary(result)
         transcript_chunks = _build_drama_transcript_chunks(result)
         transcript_timeline = result.get("transcript_timeline", []) or []
+        fallback_segments = int(result.get("fallback_segments", 0) or 0)
+        fallback_speakers = result.get("fallback_speakers", []) or []
+        fallback_voice_profile = result.get("fallback_voice_profile", "待詔·唐伯虎")
 
         if mode == OutputMode.STREAM:
             vc = await _ensure_voice_client(ctx)
@@ -2111,6 +2130,10 @@ async def cmd_drama(ctx, *, args: str = ""):
             vc.play(source)
             await status_msg.edit(content="🔊 廣播劇已開始播放")
             await ctx.send(summary)
+            if fallback_segments > 0:
+                await ctx.send(
+                    f"⚠️ 角色 fallback：{fallback_segments} 段使用 `{fallback_voice_profile}` 聲線（原角色：{', '.join(fallback_speakers)}）"
+                )
             if transcript_timeline:
                 await ctx.send("📝 **廣播劇文字同步（逐句）**")
                 first = transcript_timeline[0]
@@ -2137,6 +2160,10 @@ async def cmd_drama(ctx, *, args: str = ""):
 
             await status_msg.edit(content="✅ 廣播劇已生成")
             await ctx.send(summary)
+            if fallback_segments > 0:
+                await ctx.send(
+                    f"⚠️ 角色 fallback：{fallback_segments} 段使用 `{fallback_voice_profile}` 聲線（原角色：{', '.join(fallback_speakers)}）"
+                )
             for chunk in transcript_chunks:
                 await ctx.send(chunk)
             await ctx.send(
