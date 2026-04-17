@@ -13,3 +13,4 @@ test_output/**/*.ogg
 
 # 但保留 manifest.json
 !test_output/**/manifest.json.env
+.env
