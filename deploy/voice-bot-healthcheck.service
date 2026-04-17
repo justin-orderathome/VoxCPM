@@ -1,0 +1,8 @@
+[Unit]
+Description=Voice Bot Healthcheck (one-shot)
+After=default.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hermes01/projects/VoxCPM
+ExecStart=/home/hermes01/projects/VoxCPM/venv/bin/python /home/hermes01/projects/VoxCPM/scripts/wangdom/voice_bot_healthcheck.py --auto-fix --json

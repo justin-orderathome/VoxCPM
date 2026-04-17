@@ -127,80 +127,68 @@ def _normalize_speaker_name(raw: str) -> str:
 
 
 def _parse_reading_markdown_segments(reading_path: Path) -> tuple[list[dict], list[str]]:
-    lines = reading_path.read_text(encoding="utf-8").splitlines()
-    header_re = re.compile(r"^\s*(?:\S+\s+)?([^：（:]+?)\s*(?:（([^）]*)）)?\s*[:：]\s*$")
-    stage_re = re.compile(r"^\s*[（(].*[）)]\s*$")
-    act_re = re.compile(r"^\s*【第.+幕[:：].+】\s*$")
+    """使用 DialogueParser v1.2 自動偵測對話/朗讀模式並剖析。
 
-    in_drama = False
-    current = None
-    segments: list[dict] = []
+    傳回 (normalized_segments, errors)。
+    每個 segment 包含既有欄位（id, speaker, text, mood, timing, voice, subtitle）
+    以及 v1.2 新增欄位（ambience, transition, act_title）。
+    """
+    try:
+        text = reading_path.read_text(encoding="utf-8")
+    except Exception as e:
+        return [], [f"讀取失敗：{e}"]
+
+    parser = DialogueParser(compile_mode="auto")
+    try:
+        parsed = parser.parse(text)
+    except Exception as e:
+        return [], [f"剖析失敗：{e}"]
+
+    if not parsed:
+        return [], ["未解析到任何段落（請檢查閱讀版格式）"]
+
     errors: list[str] = []
+    norm_segments: list[dict] = []
 
-    for idx, raw in enumerate(lines, start=1):
-        line = raw.strip()
-        if line.startswith("## 劇本"):
-            in_drama = True
-            continue
-        if not in_drama:
-            continue
-        if not line or line == "---" or stage_re.match(line) or act_re.match(line) or line.startswith(">"):
-            if current and line in {"", "---"}:
-                text = " ".join(current["buf"]).strip()
-                if text:
-                    current["text"] = text
-                    segments.append(current)
-                else:
-                    errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
-                current = None
+    for i, seg in enumerate(parsed, start=1):
+        speaker = _normalize_speaker_name(seg.speaker)
+        text = seg.text.strip()
+        if not text:
             continue
 
-        m = header_re.match(line)
-        if m:
-            if current:
-                text = " ".join(current["buf"]).strip()
-                if text:
-                    current["text"] = text
-                    segments.append(current)
-                else:
-                    errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
-            speaker = _normalize_speaker_name(m.group(1))
-            note = (m.group(2) or "").strip()
-            current = {
-                "line": idx,
-                "speaker": speaker,
-                "mood": None,
-                "expression_tags": [note] if note else [],
-                "pause_after": 0.5,
-                "buf": [],
-            }
-            continue
-
-        if current:
-            current["buf"].append(line)
-
-    if current:
-        text = " ".join(current["buf"]).strip()
-        if text:
-            current["text"] = text
-            segments.append(current)
-        else:
-            errors.append(f"L{current['line']}: 角色標頭後無台詞內容")
-
-    norm_segments = []
-    for i, seg in enumerate(segments, start=1):
+        ambience_val = seg.ambience if seg.ambience and seg.ambience != "none" else "none"
         norm_segments.append(
             {
                 "id": i,
-                "speaker": seg["speaker"],
-                "text": seg["text"],
-                "mood": seg.get("mood"),
-                "expression_tags": seg.get("expression_tags", []),
-                "timing": {"pause_after": seg.get("pause_after", 0.5), "start_sec": None, "duration_sec": None},
-                "voice": {"profile": seg["speaker"], "ambience": "none", "sample_rate": 48000},
-                "subtitle": {"text": seg["text"], "lead_time_ms": 0, "display_mode": "timed"},
+                "speaker": speaker,
+                "text": text,
+                "mood": seg.mood,
+                "expression_tags": seg.expression_tags or [],
+                "timing": {
+                    "pause_after": seg.pause_after if seg.pause_after else 0.5,
+                    "start_sec": None,
+                    "duration_sec": None,
+                },
+                "voice": {
+                    "profile": speaker,
+                    "ambience": ambience_val,
+                    "sample_rate": 48000,
+                },
+                "subtitle": {
+                    "text": text,
+                    "lead_time_ms": 0,
+                    "display_mode": "timed",
+                },
+                # v1.2 新增欄位
+                "transition": seg.transition if seg.transition and seg.transition != "none" else None,
+                "act_title": seg.act_title,
             }
         )
+
+    # 重新編號（跳過空段後）
+    for idx, seg in enumerate(norm_segments, start=1):
+        seg["id"] = idx
+
     return norm_segments, errors
 
 
@@ -211,10 +199,16 @@ def _compile_reading_to_json(reading_path: Path, json_path: Path) -> tuple[bool,
             return False, "；".join(errors[:5])
         if not segments:
             return False, "未解析到任何對話段（請檢查閱讀版格式）"
+
+        # 偵測 compile_mode 寫入 metadata
+        has_act_titles = any(seg.get("act_title") for seg in segments)
+        compile_mode = "narration" if has_act_titles else "dialogue"
+
         payload = {
             "schema_version": "drama-script/v1",
             "title": reading_path.parent.name,
             "date": datetime.now(TW_TZ).strftime("%Y-%m-%d"),
+            "compile_mode": compile_mode,
             "source": {
                 "reading_file": str(reading_path.name),
                 "generated_at": datetime.now(TW_TZ).isoformat(),
