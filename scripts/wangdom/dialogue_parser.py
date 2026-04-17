@@ -244,19 +244,28 @@ class DialogueParser:
 
     @staticmethod
     def _is_emoji(ch: str) -> bool:
-        """粗略判斷字元是否為 emoji（Unicode 範圍）"""
+        """判斷字元是否為 emoji（Unicode 範圍，完整覆蓋）。"""
         cp = ord(ch)
         return (
-            (0x1F600 <= cp <= 0x1F64F)    # Emoticons
-            or (0x1F300 <= cp <= 0x1F5FF)  # Misc Symbols and Pictographs
-            or (0x1F680 <= cp <= 0x1F6FF)  # Transport and Map
-            or (0x1F1E0 <= cp <= 0x1F1FF)  # Flags
-            or (0x2600 <= cp <= 0x26FF)    # Misc symbols
-            or (0x2700 <= cp <= 0x27BF)    # Dingbats
-            or (0xFE00 <= cp <= 0xFE0F)    # Variation Selectors
-            or (0x1F900 <= cp <= 0x1F9FF)  # Supplemental Symbols
-            or (0x1FA00 <= cp <= 0x1FA6F)  # Chess Symbols
-            or (0x1FA70 <= cp <= 0x1FAFF)  # Symbols Extended-A
+            # ── 常用 Emoji 區段 ──
+            (0x2600 <= cp <= 0x26FF)        # Misc Symbols (⚔🗡 등)
+            or (0x2700 <= cp <= 0x27BF)     # Dingbats
+            or (0x1F300 <= cp <= 0x1F5FF)   # Misc Symbols & Pictographs (🏔🗡 등)
+            or (0x1F600 <= cp <= 0x1F64F)   # Emoticons
+            or (0x1F680 <= cp <= 0x1F6FF)   # Transport & Map
+            or (0x1F900 <= cp <= 0x1F9FF)   # Supplemental Symbols
+            or (0x1FA00 <= cp <= 0x1FAFF)   # Chess / Extended-A
+            or (0x1FAE0 <= cp <= 0x1FAEF)   # Extended-B (🫠🫡 等)
+            or (0x1F1E0 <= cp <= 0x1F1FF)   # Flags
+            # ── 較少見但仍在用的區段 ──
+            or (0x2300 <= cp <= 0x23FF)     # Misc Technical (⚡♿ 等)
+            or (0x2B50 <= cp <= 0x2B55)     # Stars (⭐ 等)
+            or (0x1F7E0 <= cp <= 0x1F7FF)   # Geometric Shapes Extended
+            or (0x1F0CF == cp)              # Playing card
+            # ── 修飾符 ──
+            or (0xFE00 <= cp <= 0xFE0F)     # Variation Selectors
+            or (0x200D == cp)               # Zero Width Joiner
+            or (0x20E3 == cp)               # Combining Enclosing Keycap
         )
 
     @staticmethod

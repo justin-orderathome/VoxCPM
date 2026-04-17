@@ -3,10 +3,6 @@
 
 將導演劇本（director script）解析為結構化 JSON，供 merger.py 逐段生成語音。
 
-與 v1 DialogueParser 的差異：
-  - v1 用正則解析閱讀版.md（人類先寫好結構）
-  - v2 用 LLM 全量解析導演劇本.md（自由格式 → 結構化）
-
 解析流程：
   1. yaml.safe_load → frontmatter（標準庫，不走 LLM）
   2. body → SHA-256 hash → 檢查快取
@@ -14,10 +10,6 @@
   4. 快取未命中 → LLM 全量解析（prompt + JSON schema）
   5. JSON schema 驗證 → 失敗則自動調教循環（最多 3 次）
   6. 寫入快取 → 返回 DirectorScript
-
-Fallback：
-  - LLM 解析全部失敗 → fallback 到 v1.2 DialogueParser（正則解析）
-  - v1.2 也失敗 → 報錯 + log 人工介入
 
 用法：
   python director_parser.py 導演劇本.md -o 語音版.json
@@ -40,7 +32,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# 同目錄 import（v1.2 fallback）
+# 同目錄 import
 _wangdom_dir = str(Path(__file__).parent)
 if _wangdom_dir not in sys.path:
     sys.path.insert(0, _wangdom_dir)
@@ -429,19 +421,16 @@ class DirectorParser:
         model: str = "glm-5-turbo",
         max_retries: int = MAX_RETRIES,
         enable_cache: bool = True,
-        enable_fallback: bool = True,
     ):
         """
         Args:
             model: LLM 模型名稱（OpenAI 相容 API）
             max_retries: 自動調教最大重試次數
             enable_cache: 是否啟用快取
-            enable_fallback: 是否在 LLM 全部失敗後 fallback 到 v1.2
         """
         self.model = model
         self.max_retries = max_retries
         self.enable_cache = enable_cache
-        self.enable_fallback = enable_fallback
 
     def parse_file(self, path: str | Path) -> ParseResult:
         """從檔案解析導演劇本"""
@@ -504,21 +493,6 @@ class DirectorParser:
                 cp = _cache_path(script_dir, h)
                 _write_cache(cp, llm_result.data)
             return llm_result
-
-        # 4. Fallback 到 v1.2 DialogueParser
-        if self.enable_fallback:
-            logger.warning(f"LLM 解析失敗（重試 {llm_result.retry_count} 次），fallback 到 v1.2 DialogueParser")
-            fallback_result = self._fallback_v1(
-                script=script,
-                meta=meta,
-                title=title,
-                date_str=date_str,
-                narrator=narrator,
-                ambience_default=ambience_default,
-                transition_default=transition_default,
-                script_dir=script_dir,
-            )
-            return fallback_result
 
         return llm_result
 
@@ -665,14 +639,6 @@ class DirectorParser:
         if data is None:
             error_msg = "Hermes 傳入的 JSON 無法解析"
             logger.error(error_msg)
-
-            # Fallback 到 v1.2
-            if self.enable_fallback:
-                return self._fallback_v1(
-                    script=script, meta=meta, title=title, date_str=date_str,
-                    narrator=narrator, ambience_default=ambience_default,
-                    transition_default=transition_default, script_dir=script_dir,
-                )
             return ParseResult(success=False, error=error_msg, retry_count=0)
 
         # 4. 填充來源資訊
@@ -690,12 +656,6 @@ class DirectorParser:
             error_msg = f"Schema 驗證失敗（{len(errors)} 項）：{'；'.join(errors[:5])}"
             logger.warning(error_msg)
 
-            if self.enable_fallback:
-                return self._fallback_v1(
-                    script=script, meta=meta, title=title, date_str=date_str,
-                    narrator=narrator, ambience_default=ambience_default,
-                    transition_default=transition_default, script_dir=script_dir,
-                )
             return ParseResult(success=False, error=error_msg, retry_count=0)
 
         # 6. 寫入快取
@@ -707,145 +667,6 @@ class DirectorParser:
         logger.info(f"Hermes LLM 解析成功，共 {len(data.get('segments', []))} 段")
         return ParseResult(success=True, data=data, retry_count=0)
 
-    def _fallback_v1(
-        self,
-        script: str,
-        meta: dict,
-        title: str,
-        date_str: str,
-        narrator: str,
-        ambience_default: str,
-        transition_default: str,
-        script_dir: Optional[str | Path] = None,
-    ) -> ParseResult:
-        """Fallback 到 v1.2 DialogueParser（正則解析）"""
-        try:
-            from dialogue_parser import DialogueParser, extract_frontmatter
-
-            parser = DialogueParser(
-                compile_mode=meta.get("compile_mode", "auto"),
-                narrator_speaker=narrator,
-            )
-            v1_segments = parser.parse(script)
-
-            if not v1_segments:
-                return ParseResult(
-                    success=False,
-                    error="v1.2 DialogueParser 也無法解析（0 段）",
-                    retry_count=self.max_retries,
-                    fallback_used=True,
-                )
-
-            # 轉換為 v2 格式
-            segments_v2 = []
-            scene_segments: Dict[int, List[int]] = {}
-            act_number = 0
-            current_act_title: Optional[str] = None
-
-            for i, seg in enumerate(v1_segments, 1):
-                seg_dict = seg.to_dict()
-
-                # 追蹤幕切換
-                act_title = seg_dict.get("act_title")
-                if act_title and act_title != current_act_title:
-                    act_number += 1
-                    current_act_title = act_title
-                    scene_segments[act_number] = []
-
-                if act_number > 0:
-                    scene_segments.setdefault(act_number, []).append(i)
-
-                segments_v2.append({
-                    "id": i,
-                    "type": "dialogue" if seg.speaker != narrator else "narration",
-                    "speaker": seg.speaker,
-                    "text": seg_dict.get("text", ""),
-                    "mood": seg_dict.get("mood"),
-                    "expression_tags": seg_dict.get("expression_tags", []),
-                    "scene_number": max(act_number, 1),
-                    "timing": {
-                        "pause_before": 0.0,
-                        "pause_after": seg_dict.get("pause_after", 0.5),
-                    },
-                    "voice": {
-                        "profile": seg.speaker,
-                        "ambience": seg_dict.get("ambience", ambience_default) or ambience_default,
-                        "sample_rate": 48000,
-                    },
-                    "subtitle": {
-                        "text": seg_dict.get("text", ""),
-                        "lead_time_ms": 0,
-                        "display_mode": "timed",
-                    },
-                    "transition": seg_dict.get("transition") if i == 1 else None,
-                    "act_title": current_act_title,
-                })
-
-            # 組裝 scenes
-            scenes = []
-            for act_num, seg_ids in scene_segments.items():
-                scenes.append({
-                    "act_title": current_act_title or f"第{act_num}幕",
-                    "act_number": act_num,
-                    "meta": None,  # v1 無法解析場景 meta
-                    "segment_ids": seg_ids,
-                })
-
-            # 若無幕分割，整篇視為一幕
-            if not scenes:
-                scenes.append({
-                    "act_title": title,
-                    "act_number": 1,
-                    "meta": None,
-                    "segment_ids": list(range(1, len(segments_v2) + 1)),
-                })
-
-            v2_data = {
-                "schema_version": "director-script/v2",
-                "compile_mode": meta.get("compile_mode", "auto") if meta.get("compile_mode") in VALID_COMPILE_MODES else "dialogue",
-                "title": title,
-                "date": date_str,
-                "source": {
-                    "file": "導演劇本.md",
-                    "generated_at": datetime.now(TST).isoformat(),
-                    "parser": "director-parser/v2-fallback-v1",
-                    "cache_hit": False,
-                    "retry_count": self.max_retries,
-                },
-                "frontmatter": {
-                    "narrator": narrator,
-                    "ambience_default": ambience_default,
-                    "transition_default": transition_default,
-                },
-                "scenes": scenes,
-                "segments": segments_v2,
-                "segments_total": len(segments_v2),
-                "scenes_total": len(scenes),
-            }
-
-            logger.info(f"v1.2 fallback 成功，共 {len(segments_v2)} 段")
-            return ParseResult(
-                success=True,
-                data=v2_data,
-                retry_count=self.max_retries,
-                fallback_used=True,
-            )
-
-        except ImportError:
-            return ParseResult(
-                success=False,
-                error="v1.2 DialogueParser 模組不可用（import 失敗）",
-                retry_count=self.max_retries,
-                fallback_used=True,
-            )
-        except Exception as e:
-            return ParseResult(
-                success=False,
-                error=f"v1.2 fallback 失敗：{e}",
-                retry_count=self.max_retries,
-                fallback_used=True,
-            )
-
 
 # ─── 工具函式 ─────────────────────────────────────────────
 
@@ -854,7 +675,6 @@ def parse_director_script(
     model: str = "glm-5-turbo",
     max_retries: int = MAX_RETRIES,
     enable_cache: bool = True,
-    enable_fallback: bool = True,
 ) -> ParseResult:
     """便捷函式：解析導演劇本檔案。
 
@@ -863,7 +683,6 @@ def parse_director_script(
         model: LLM 模型名稱
         max_retries: 最大重試次數
         enable_cache: 是否啟用快取
-        enable_fallback: 是否啟用 v1.2 fallback
 
     Returns:
         ParseResult
@@ -872,7 +691,6 @@ def parse_director_script(
         model=model,
         max_retries=max_retries,
         enable_cache=enable_cache,
-        enable_fallback=enable_fallback,
     )
     return parser.parse_file(path)
 
@@ -895,7 +713,7 @@ def main() -> None:
 範例：
   python director_parser.py 導演劇本.md -o 語音版.json
   python director_parser.py 導演劇本.md --validate-only
-  python director_parser.py 導演劇本.md --no-cache --no-fallback
+  python director_parser.py 導演劇本.md --no-cache
   python director_parser.py 導演劇本.md --model glm-5-turbo
         """,
     )
@@ -904,7 +722,6 @@ def main() -> None:
     ap.add_argument("--model", default="glm-5-turbo", help="LLM 模型（預設 glm-5-turbo）")
     ap.add_argument("--max-retries", type=int, default=MAX_RETRIES, help="最大重試次數")
     ap.add_argument("--no-cache", action="store_true", help="停用快取")
-    ap.add_argument("--no-fallback", action="store_true", help="停用 v1.2 fallback")
     ap.add_argument("--validate-only", action="store_true", help="僅驗證 schema，不做 LLM 解析")
 
     args = ap.parse_args()
@@ -931,7 +748,6 @@ def main() -> None:
         model=args.model,
         max_retries=args.max_retries,
         enable_cache=not args.no_cache,
-        enable_fallback=not args.no_fallback,
     )
 
     if result.success and result.data:

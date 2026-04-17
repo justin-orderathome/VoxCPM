@@ -56,7 +56,7 @@ if str(_BOT_DIR) not in sys.path:
 from voxcpm_skill import VoiceProfileManager
 from style_compiler import compile_text
 from audio_post import post_process
-from dialogue_parser import DialogueParser
+
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +90,64 @@ ROLE_EMOJI = {
     "司空·大禹": "🌊",
     "使君·劉備": "🍑",
     "司天監·李淳風": "🔮",
+    "全場": "🔮",
+    "群臣": "🔮",
+    "眾人": "🔮",
 }
+
+
+# ---------------------------------------------------------------------------
+# Emoji 剝除（防禦性：JSON speaker 若殘留 emoji 前綴，自動清除）
+# ---------------------------------------------------------------------------
+def _is_emoji_char(ch: str) -> bool:
+    """判斷單一 Unicode codepoint 是否為 emoji（完整覆蓋所有 emoji 區段）。"""
+    cp = ord(ch)
+    return (
+        # ── 常用 Emoji 區段 ──
+        (0x2600 <= cp <= 0x26FF)        # Misc Symbols (⚔🗡 등)
+        or (0x2700 <= cp <= 0x27BF)     # Dingbats
+        or (0x1F300 <= cp <= 0x1F5FF)   # Misc Symbols & Pictographs (🏔🗡 등)
+        or (0x1F600 <= cp <= 0x1F64F)   # Emoticons
+        or (0x1F680 <= cp <= 0x1F6FF)   # Transport & Map
+        or (0x1F900 <= cp <= 0x1F9FF)   # Supplemental Symbols
+        or (0x1FA00 <= cp <= 0x1FAFF)   # Chess / Extended-A
+        or (0x1FAE0 <= cp <= 0x1FAEF)   # Extended-B (🫠🫡 等)
+        or (0x1F1E0 <= cp <= 0x1F1FF)   # Flags
+        # ── 較少見但仍在用的區段 ──
+        or (0x2300 <= cp <= 0x23FF)     # Misc Technical (⚡♿ 等)
+        or (0x2B50 <= cp <= 0x2B55)     # Stars (⭐ 等)
+        or (0x231A <= cp <= 0x231B)     # Watch / Hourglass
+        or (0x23E9 <= cp <= 0x23F3)     # Media controls
+        or (0x23F8 <= cp <= 0x23FA)     # More media controls
+        or (0x25AA <= cp <= 0x25AB)     # Squares
+        or (0x25B6 <= cp <= 0x25B6)     # Play button
+        or (0x25C0 <= cp <= 0x25C0)     # Reverse button
+        or (0x25FB <= cp <= 0x25FE)     # Squares
+        or (0x261D <= cp <= 0x261D)     # Index pointing up
+        or (0x26F9 <= cp <= 0x26F9)     # Person with ball
+        or (0x1F7E0 <= cp <= 0x1F7FF)   # Geometric Shapes Extended
+        or (0x1F0CF <= cp <= 0x1F0CF)   # Playing card
+        # ── 修飾符 ──
+        or (0xFE00 <= cp <= 0xFE0F)     # Variation Selectors
+        or (0x200D == cp)               # Zero Width Joiner
+        or (0x20E3 == cp)               # Combining Enclosing Keycap
+        or (0xE0020 <= cp <= 0xE007F)   # Tags (flag sequences)
+    )
+
+
+def _strip_leading_emoji(text: str) -> str:
+    """移除字串開頭的所有 emoji 字元（含 multi-codepoint 組合如 ⚔️ = U+2694 + U+FE0F）。"""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if _is_emoji_char(ch):
+            i += 1
+            # 跳過 variation selector / ZWJ / keycap
+            while i < len(text) and _is_emoji_char(text[i]) and ord(text[i]) in {0xFE00, 0xFE0F, 0x200D, 0x20E3}:
+                i += 1
+        else:
+            break
+    return text[i:].strip()
 
 DRAMA_VAULT_ROOT = Path.home() / "projects" / "second-brain-clerk" / "wiki" / "崴勝王朝" / "趣聞閣"
 SPEAKER_ALIAS = {
@@ -109,117 +166,6 @@ SPEAKER_ALIAS = {
     "群臣": "司天監·李淳風",
     "眾人": "司天監·李淳風",
 }
-
-
-def _normalize_speaker_name(raw: str) -> str:
-    name = raw.strip()
-    name = re.sub(r"^[^\w\u4e00-\u9fff]+\s*", "", name)
-    name = name.replace("·", "·")
-    if name in ROLE_EMOJI:
-        return name
-    if name in SPEAKER_ALIAS:
-        return SPEAKER_ALIAS[name]
-    for full in ROLE_EMOJI.keys():
-        short = full.split("·", 1)[-1]
-        if name == short:
-            return full
-    return name
-
-
-def _parse_reading_markdown_segments(reading_path: Path) -> tuple[list[dict], list[str]]:
-    """使用 DialogueParser v1.2 自動偵測對話/朗讀模式並剖析。
-
-    傳回 (normalized_segments, errors)。
-    每個 segment 包含既有欄位（id, speaker, text, mood, timing, voice, subtitle）
-    以及 v1.2 新增欄位（ambience, transition, act_title）。
-    """
-    try:
-        text = reading_path.read_text(encoding="utf-8")
-    except Exception as e:
-        return [], [f"讀取失敗：{e}"]
-
-    parser = DialogueParser(compile_mode="auto")
-    try:
-        parsed = parser.parse(text)
-    except Exception as e:
-        return [], [f"剖析失敗：{e}"]
-
-    if not parsed:
-        return [], ["未解析到任何段落（請檢查閱讀版格式）"]
-
-    errors: list[str] = []
-    norm_segments: list[dict] = []
-
-    for i, seg in enumerate(parsed, start=1):
-        speaker = _normalize_speaker_name(seg.speaker)
-        text = seg.text.strip()
-        if not text:
-            continue
-
-        ambience_val = seg.ambience if seg.ambience and seg.ambience != "none" else "none"
-        norm_segments.append(
-            {
-                "id": i,
-                "speaker": speaker,
-                "text": text,
-                "mood": seg.mood,
-                "expression_tags": seg.expression_tags or [],
-                "timing": {
-                    "pause_after": seg.pause_after if seg.pause_after else 0.5,
-                    "start_sec": None,
-                    "duration_sec": None,
-                },
-                "voice": {
-                    "profile": speaker,
-                    "ambience": ambience_val,
-                    "sample_rate": 48000,
-                },
-                "subtitle": {
-                    "text": text,
-                    "lead_time_ms": 0,
-                    "display_mode": "timed",
-                },
-                # v1.2 新增欄位
-                "transition": seg.transition if seg.transition and seg.transition != "none" else None,
-                "act_title": seg.act_title,
-            }
-        )
-
-    # 重新編號（跳過空段後）
-    for idx, seg in enumerate(norm_segments, start=1):
-        seg["id"] = idx
-
-    return norm_segments, errors
-
-
-def _compile_reading_to_json(reading_path: Path, json_path: Path) -> tuple[bool, str]:
-    try:
-        segments, errors = _parse_reading_markdown_segments(reading_path)
-        if errors:
-            return False, "；".join(errors[:5])
-        if not segments:
-            return False, "未解析到任何對話段（請檢查閱讀版格式）"
-
-        # 偵測 compile_mode 寫入 metadata
-        has_act_titles = any(seg.get("act_title") for seg in segments)
-        compile_mode = "narration" if has_act_titles else "dialogue"
-
-        payload = {
-            "schema_version": "drama-script/v1",
-            "title": reading_path.parent.name,
-            "date": datetime.now(TW_TZ).strftime("%Y-%m-%d"),
-            "compile_mode": compile_mode,
-            "source": {
-                "reading_file": str(reading_path.name),
-                "generated_at": datetime.now(TW_TZ).isoformat(),
-            },
-            "segments_total": len(segments),
-            "segments": segments,
-        }
-        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        return True, ""
-    except Exception as e:
-        return False, str(e)
 
 
 def _resolve_drama_script_input(script_arg: str) -> tuple[Optional[Path], str]:
@@ -244,21 +190,18 @@ def _resolve_drama_script_input(script_arg: str) -> tuple[Optional[Path], str]:
         if json_path.exists():
             return json_path, ""
 
-        reading_path = folder / "閱讀版.md"
-        if reading_path.exists():
-            ok, err = _compile_reading_to_json(reading_path, json_path)
-            if ok:
-                return json_path, ""
-            return None, f"自動編譯語音版.json失敗：{err}"
-
-        return None, f"資料夾缺少語音版.json與閱讀版.md：{folder}"
+        return None, f"資料夾缺少語音版.json：{folder}（請先用 director-parser 從導演劇本.md 生成）"
 
     return None, f"劇本檔案不存在：{raw}"
 
 
 def _fmt_line(text: str, speaker: str) -> str:
-    emoji = ROLE_EMOJI.get(speaker, "")
-    return f"\u200b\n\n{emoji}{text}（{speaker}）"
+    clean = _strip_leading_emoji(speaker)
+    emoji = ROLE_EMOJI.get(clean, "")
+    if not emoji:
+        canonical = SPEAKER_ALIAS.get(clean, "")
+        emoji = ROLE_EMOJI.get(canonical, "") if canonical else ""
+    return f"\u200b\n\n{emoji}{text}（{clean}）"
 
 
 # ---------------------------------------------------------------------------
@@ -1136,45 +1079,35 @@ def _render_drama_audio(
     import gc
     import torch
 
-    parser = DialogueParser()
     script_file = Path(script_path)
-    if script_file.suffix.lower() == ".json":
-        try:
-            payload = json.loads(script_file.read_text(encoding="utf-8"))
-        except Exception as e:
-            return {"ok": False, "reason": f"語音版.json 解析失敗：{e}"}
-        raw_segments = payload.get("segments", [])
-        if not isinstance(raw_segments, list):
-            return {"ok": False, "reason": "語音版.json 缺少 segments[]"}
-        segments = []
-        for row in raw_segments:
-            if not isinstance(row, dict):
-                continue
-            speaker = str(row.get("speaker", "")).strip()
-            text = str(row.get("text", "")).strip()
-            if not speaker or not text:
-                continue
-            timing = row.get("timing", {}) or {}
-            segments.append(
-                {
-                    "speaker": speaker,
-                    "text": text,
-                    "mood": row.get("mood"),
-                    "expression_tags": row.get("expression_tags") or None,
-                    "pause_after": float(timing.get("pause_after", 0.5) or 0.5),
-                }
-            )
-    else:
-        segments = [
+    if script_file.suffix.lower() != ".json":
+        return {"ok": False, "reason": f"僅支援語音版.json，不支援 .md 直接播放（請先用 director-parser 生成）"}
+
+    try:
+        payload = json.loads(script_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"ok": False, "reason": f"語音版.json 解析失敗：{e}"}
+    raw_segments = payload.get("segments", [])
+    if not isinstance(raw_segments, list):
+        return {"ok": False, "reason": "語音版.json 缺少 segments[]"}
+    segments = []
+    for row in raw_segments:
+        if not isinstance(row, dict):
+            continue
+        speaker = _strip_leading_emoji(str(row.get("speaker", ""))).strip()
+        text = str(row.get("text", "")).strip()
+        if not speaker or not text:
+            continue
+        timing = row.get("timing", {}) or {}
+        segments.append(
             {
-                "speaker": s.speaker,
-                "text": s.text,
-                "mood": s.mood,
-                "expression_tags": s.expression_tags,
-                "pause_after": float(getattr(s, "pause_after", 0.5) or 0.5),
+                "speaker": speaker,
+                "text": text,
+                "mood": row.get("mood"),
+                "expression_tags": row.get("expression_tags") or None,
+                "pause_after": float(timing.get("pause_after", 0.5) or 0.5),
             }
-            for s in parser.parse_file(script_path)
-        ]
+        )
 
     if not segments:
         return {"ok": False, "reason": "劇本沒有可解析段落"}
