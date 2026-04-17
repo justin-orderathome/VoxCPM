@@ -56,6 +56,7 @@ if str(_BOT_DIR) not in sys.path:
 from voxcpm_skill import VoiceProfileManager
 from style_compiler import compile_text
 from audio_post import post_process
+from director_parser import parse_director_script, save_voice_json
 
 
 
@@ -190,7 +191,12 @@ def _resolve_drama_script_input(script_arg: str) -> tuple[Optional[Path], str]:
         if json_path.exists():
             return json_path, ""
 
-        return None, f"資料夾缺少語音版.json：{folder}（請先用 director-parser 從導演劇本.md 生成）"
+        # 檢查導演劇本.md 是否存在，供 caller 自動生成
+        md_path = folder / "導演劇本.md"
+        if md_path.exists():
+            return None, f"__AUTO_COMPILE__:{folder}"
+
+        return None, f"資料夾缺少語音版.json：{folder}（亦無導演劇本.md 可供自動生成）"
 
     return None, f"劇本檔案不存在：{raw}"
 
@@ -1971,8 +1977,28 @@ async def cmd_drama(ctx, *, args: str = ""):
 
     resolved_script_file, resolve_err = _resolve_drama_script_input(script_path)
     if not resolved_script_file:
-        await ctx.send(f"⚠️ {resolve_err}")
-        return
+        # ── 自動生成語音版.json ──
+        if resolve_err.startswith("__AUTO_COMPILE__:"):
+            folder = Path(resolve_err.split(":", 1)[1])
+            md_path = folder / "導演劇本.md"
+            json_path = folder / "語音版.json"
+            status_msg = await ctx.send(f"📜 偵測到缺少語音版.json，自動從導演劇本.md 生成中…（LLM 呼叫，請稍候）")
+            try:
+                result = await asyncio.to_thread(parse_director_script, md_path)
+                if result.success and result.data:
+                    save_voice_json(result.data, json_path)
+                    resolved_script_file = json_path
+                    await status_msg.edit(content=f"✅ 語音版.json 自動生成完成，開始播放 {folder.name}")
+                else:
+                    err_detail = result.error or "未知錯誤"
+                    await status_msg.edit(content=f"❌ 語音版.json 自動生成失敗：{err_detail}")
+                    return
+            except Exception as exc:
+                await status_msg.edit(content=f"❌ 自動生成異常：{exc}")
+                return
+        else:
+            await ctx.send(f"⚠️ {resolve_err}")
+            return
 
     script_file = resolved_script_file
 
