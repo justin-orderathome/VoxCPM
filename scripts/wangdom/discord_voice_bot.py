@@ -1121,9 +1121,10 @@ def _check_drama_cache(script_path: str, segments_count: int) -> Path | None:
     merged_path = cache_dir / "merged.wav"
     manifest = _read_drama_manifest(cache_dir)
     if manifest is None or not merged_path.exists():
+        print(f"[drama-cache] miss: no cache dir or manifest for {cache_dir.name}")
         return None
     if int(manifest.get("segments_total", 0)) != segments_count:
-        print(f"[drama-cache] segment count mismatch: cache={manifest.get('segments_total')}, script={segments_count}")
+        print(f"[drama-cache] miss: segment count mismatch cache={manifest.get('segments_total')} vs script={segments_count}")
         return None
     print(f"[drama-cache] ✅ 快取命中 {cache_dir.name}（{segments_count} 段）")
     return merged_path
@@ -1139,7 +1140,7 @@ def _save_drama_cache(script_path: str, merged_wav_path: str, segments_count: in
         _write_drama_manifest(cache_dir, {
             "segments_total": segments_count,
             "out_sample_rate": sr,
-            "created_at": datetime.now(TST).isoformat(),
+            "created_at": datetime.now().isoformat(),
         })
         print(f"[drama-cache] ✅ 快取已寫入 {cache_dir.name}（{segments_count} 段）")
     except Exception as e:
