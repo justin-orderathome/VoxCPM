@@ -66,6 +66,7 @@ from director_parser import parse_director_script, save_voice_json
 PROJECT_DIR = _PROJECT_DIR
 PROFILES_PATH = PROJECT_DIR / "profiles" / "voice_profiles.yaml"
 OUTPUT_DIR = PROJECT_DIR / "test_output" / "voice_bot"
+DRAMA_CACHE_DIR = OUTPUT_DIR / "drama_cache"
 MORNING_CONFIG_PATH = PROJECT_DIR / "profiles" / "morning_schedule.json"
 TW_TZ = ZoneInfo("Asia/Taipei")
 HEARTBEAT_PATH = PROJECT_DIR / "output" / "voice-bot-heartbeat.json"
@@ -150,7 +151,7 @@ def _strip_leading_emoji(text: str) -> str:
             break
     return text[i:].strip()
 
-DRAMA_VAULT_ROOT = Path.home() / "projects" / "second-brain-clerk" / "wiki" / "崴勝王朝" / "趣聞閣"
+DRAMA_VAULT_ROOT = Path(os.environ.get("VAULT_PATH", str(Path.home() / "projects" / "second-brain-clerk"))) / "wiki" / "崴勝王朝" / "趣聞閣"
 SPEAKER_ALIAS = {
     "主公": "主公·劉邦",
     "諸葛亮": "軍師·諸葛亮",
@@ -873,20 +874,13 @@ async def _morning_scheduler_loop():
 
 
 def _load_tianji_report() -> dict:
-    script = Path.home() / ".hermes" / "scripts" / "tianji-report.py"
-    if not script.exists():
-        return {"error": f"tianji script not found: {script}"}
+    """從天機曆 HTTP API 取得天機報（不再 subprocess hermes 腳本）"""
+    import urllib.request, urllib.error
+    api = os.environ.get("TIANJI_API_URL", "http://127.0.0.1:8002")
     try:
-        result = subprocess.run(
-            [sys.executable, str(script)],
-            capture_output=True,
-            text=True,
-            timeout=40,
-            check=False,
-        )
-        if result.returncode != 0:
-            return {"error": f"tianji-report failed: {result.stderr.strip()[:200]}"}
-        return json.loads(result.stdout)
+        req = urllib.request.Request(f"{api}/tianji-report")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         return {"error": str(e)}
 
@@ -1065,6 +1059,92 @@ def _convert_wav_to_mp3(wav_path: str, mp3_path: str) -> tuple[bool, str]:
 
 _VRAM_THRESHOLD_GB = 10.5  # 12GB - 1.5GB 安全邊際
 
+# ---------------------------------------------------------------------------
+# Drama 語音段快取
+# ---------------------------------------------------------------------------
+
+def _file_sha256(path: str | Path) -> str:
+    """計算檔案 SHA-256 hash。"""
+    import hashlib as _hl
+    h = _hl.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _text_sha256(text: str) -> str:
+    """計算文字 SHA-256 hash。"""
+    import hashlib as _hl
+    return _hl.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _get_drama_cache_key(script_path: str) -> str:
+    """組合 script hash + profiles hash，回傳 12 字元 cache key。"""
+    s_hash = _file_sha256(script_path)
+    p_hash = _text_sha256(PROFILES_PATH.read_text(encoding="utf-8")) if PROFILES_PATH.exists() else "none"
+    return _text_sha256(f"{s_hash}|{p_hash}")[:12]
+
+
+def _drama_cache_dir(script_path: str) -> Path:
+    """取得指定劇本的快取目錄。"""
+    key = _get_drama_cache_key(script_path)
+    return DRAMA_CACHE_DIR / key
+
+
+def _read_drama_manifest(cache_dir: Path) -> dict | None:
+    """讀取快取 manifest.json。"""
+    mf = cache_dir / "manifest.json"
+    if not mf.exists():
+        return None
+    try:
+        return json.loads(mf.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_drama_manifest(cache_dir: Path, manifest: dict) -> None:
+    """寫入快取 manifest.json。"""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _check_drama_cache(script_path: str, segments_count: int) -> Path | None:
+    """檢查快取是否完整命中。
+
+    Returns:
+        merged.wav 路徑 if cache hit, else None.
+    """
+    cache_dir = _drama_cache_dir(script_path)
+    merged_path = cache_dir / "merged.wav"
+    manifest = _read_drama_manifest(cache_dir)
+    if manifest is None or not merged_path.exists():
+        return None
+    if int(manifest.get("segments_total", 0)) != segments_count:
+        print(f"[drama-cache] segment count mismatch: cache={manifest.get('segments_total')}, script={segments_count}")
+        return None
+    print(f"[drama-cache] ✅ 快取命中 {cache_dir.name}（{segments_count} 段）")
+    return merged_path
+
+
+def _save_drama_cache(script_path: str, merged_wav_path: str, segments_count: int, sr: int) -> None:
+    """將合併後的 WAV 存入快取。"""
+    import shutil as _sh
+    cache_dir = _drama_cache_dir(script_path)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _sh.copy2(merged_wav_path, str(cache_dir / "merged.wav"))
+        _write_drama_manifest(cache_dir, {
+            "segments_total": segments_count,
+            "out_sample_rate": sr,
+            "created_at": datetime.now(TST).isoformat(),
+        })
+        print(f"[drama-cache] ✅ 快取已寫入 {cache_dir.name}（{segments_count} 段）")
+    except Exception as e:
+        print(f"[drama-cache] ⚠️ 快取寫入失敗: {e}")
+
 
 def _render_drama_audio(
     script_path: str,
@@ -1119,6 +1199,55 @@ def _render_drama_audio(
         return {"ok": False, "reason": "劇本沒有可解析段落"}
     if max_segments is not None and len(segments) > max_segments:
         return {"ok": False, "reason": f"段數超限（{len(segments)} > {max_segments}）"}
+
+    # --- 快取命中檢查 ---
+    cached_merged = _check_drama_cache(script_path, len(segments))
+    if cached_merged and cached_merged.exists():
+        try:
+            import shutil as _sh
+            _sh.copy2(str(cached_merged), str(output_wav))
+            cached_audio, _ = sf.read(str(cached_merged), dtype="float32")
+            if cached_audio.ndim == 2:
+                cached_audio = cached_audio.mean(axis=1)
+            cached_sr = int(sf.info(str(cached_merged)).samplerate)
+            cached_duration = len(cached_audio) / cached_sr
+            # 從 JSON 重建 transcript（不需重新合成）
+            t_lines = [{"speaker": seg["speaker"], "text": seg["text"].replace("\n", " ").strip()} for seg in segments]
+            # 重建 timeline（近似值：均分 + pause）
+            cursor = 0.0
+            timeline = []
+            for i, seg in enumerate(segments):
+                est_dur = len(seg["text"]) / 4.0  # 中文 ~4字/秒近似
+                pause = float(seg.get("pause_after", 0.5) or 0.5) if i < len(segments) - 1 else 0.0
+                timeline.append({
+                    "speaker": seg["speaker"],
+                    "text": seg["text"].replace("\n", " ").strip(),
+                    "start_sec": round(cursor, 3),
+                    "duration_sec": round(est_dur, 3),
+                })
+                cursor += est_dur + pause
+            preview = [{"speaker": s["speaker"], "text": (s["text"][:42] + "…") if len(s["text"]) > 42 else s["text"]} for s in segments[:3]]
+            if progress is not None:
+                progress["done"] = len(segments)
+                progress["total"] = len(segments)
+                progress["current_speaker"] = "（快取命中）"
+            print(f"[drama-cache] 快取載入完成，duration={cached_duration:.1f}s")
+            return {
+                "ok": True,
+                "output_path": str(output_wav),
+                "script_path": str(script_path),
+                "segments": len(segments),
+                "duration_sec": cached_duration,
+                "preview": preview,
+                "transcript_lines": t_lines,
+                "transcript_timeline": timeline,
+                "cache_hit": True,
+                "fallback_voice_profile": "待詔·唐伯虎",
+                "fallback_segments": 0,
+                "fallback_speakers": [],
+            }
+        except Exception as e:
+            print(f"[drama-cache] ⚠️ 快取讀取失敗，fallback 重新生成: {e}")
 
     profiles = _engine.profile_manager._profiles
     unknown = sorted({seg["speaker"] for seg in segments if seg["speaker"] not in profiles})
@@ -1295,6 +1424,9 @@ def _render_drama_audio(
         shutil.rmtree(str(_cp_dir), ignore_errors=True)
         print(f"[drama] checkpoint 已清理：{_cp_dir}")
 
+    # --- 寫入快取 ---
+    _save_drama_cache(script_path, output_wav, len(segments), sr_target)
+
     return {
         "ok": True,
         "output_path": output_wav,
@@ -1304,6 +1436,7 @@ def _render_drama_audio(
         "preview": preview,
         "transcript_lines": transcript_lines,
         "transcript_timeline": transcript_timeline,
+        "cache_hit": False,
         "fallback_voice_profile": fallback_voice,
         "fallback_segments": fallback_segments,
         "fallback_speakers": sorted(fallback_speakers_used),
@@ -1982,20 +2115,50 @@ async def cmd_drama(ctx, *, args: str = ""):
             folder = Path(resolve_err.split(":", 1)[1])
             md_path = folder / "導演劇本.md"
             json_path = folder / "語音版.json"
-            status_msg = await ctx.send(f"📜 偵測到缺少語音版.json，自動從導演劇本.md 生成中…（LLM 呼叫，請稍候）")
+            status_msg = await ctx.send(f"📜 偵測到缺少語音版.json，自動從導演劇本.md 生成中…")
+            # LLM 心跳進度 task
+            _compile_done = asyncio.Event()
+            _compile_t0 = time.monotonic()
+            async def _llm_heartbeat():
+                tips = {
+                    10: "首次解析約需 15-30 秒",
+                    30: "LLM 正在校驗中…",
+                    60: "校驗時間較長，請耐心等候",
+                    120: "仍在處理中，可能需要重試",
+                }
+                while not _compile_done.is_set():
+                    elapsed = int(time.monotonic() - _compile_t0)
+                    tip = ""
+                    for threshold, msg in sorted(tips.items()):
+                        if elapsed >= threshold:
+                            tip = msg
+                    try:
+                        await status_msg.edit(
+                            content=f"📜 LLM 解析中… ⏳ {elapsed}s{f'（{tip}）' if tip else ''}"
+                        )
+                    except Exception:
+                        break
+                    await asyncio.sleep(5)
+            heartbeat_task = asyncio.create_task(_llm_heartbeat())
             try:
                 result = await asyncio.to_thread(parse_director_script, md_path)
+                _compile_done.set()
                 if result.success and result.data:
+                    elapsed = int(time.monotonic() - _compile_t0)
                     save_voice_json(result.data, json_path)
                     resolved_script_file = json_path
-                    await status_msg.edit(content=f"✅ 語音版.json 自動生成完成，開始播放 {folder.name}")
+                    cache_note = "（快取命中）" if result.cache_hit else f"（耗時 {elapsed}s）"
+                    await status_msg.edit(content=f"✅ 語音版.json 自動生成完成 {cache_note}，開始播放 {folder.name}")
                 else:
                     err_detail = result.error or "未知錯誤"
                     await status_msg.edit(content=f"❌ 語音版.json 自動生成失敗：{err_detail}")
                     return
             except Exception as exc:
+                _compile_done.set()
                 await status_msg.edit(content=f"❌ 自動生成異常：{exc}")
                 return
+            finally:
+                heartbeat_task.cancel()
         else:
             await ctx.send(f"⚠️ {resolve_err}")
             return
@@ -2025,7 +2188,9 @@ async def cmd_drama(ctx, *, args: str = ""):
                 await asyncio.sleep(5)
                 d, t, s, v = progress["done"], progress["total"], progress["current_speaker"], progress.get("vram_gb", 0)
                 try:
-                    if t > 0:
+                    if "快取" in s:
+                        await status_msg.edit(content=f"⚡ 快取載入中 {d}/{t}（{s}）")
+                    elif t > 0:
                         await status_msg.edit(
                             content=f"🎭 生成中 {d}/{t}（{s}）| VRAM {v} GB"
                         )
@@ -2059,6 +2224,11 @@ async def cmd_drama(ctx, *, args: str = ""):
             else:
                 await status_msg.edit(content=f"❌ 廣播劇生成失敗：{result.get('reason', '未知錯誤')}")
             return
+
+        # 快取命中提示
+        cache_hit = result.get("cache_hit", False)
+        if cache_hit:
+            await status_msg.edit(content=f"⚡ 快取命中！{result.get('segments', 0)} 段直接載入（{result.get('duration_sec', 0):.1f}s）")
 
         summary = _build_drama_text_summary(result)
         transcript_chunks = _build_drama_transcript_chunks(result)
