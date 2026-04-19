@@ -793,8 +793,8 @@ class DirectorParser:
 
         # 分批解析
         logger.info(f"分批解析：{total_scenes} 個場景")
-        all_segments = []
-        all_scenes_meta = []
+        segments_map: dict[int, list] = {}   # scene_number -> segments
+        scenes_meta_map: dict[int, dict] = {}  # scene_number -> meta
         failed_batches = []
 
         # ── 並行處理每個場景 ──
@@ -867,11 +867,12 @@ class DirectorParser:
             for future in as_completed(futures):
                 sn, scene_title, scene_body, scene_meta, segs = future.result()
                 if segs is not None and scene_meta is not None:
-                    all_segments.extend(segs)
-                    all_scenes_meta.append(scene_meta)
+                    segments_map[sn] = segs
+                    scenes_meta_map[sn] = scene_meta
                 else:
                     failed_batches.append(sn)
-                parse_status = f"並行解析 {len(all_scenes_meta)}/{total_scenes}"
+                done_count = len(scenes_meta_map) + len(failed_batches)
+                parse_status = f"並行解析 {done_count}/{total_scenes}"
 
         logger.info(f"[並行] 完成 {total_scenes - len(failed_batches)}/{total_scenes}，失敗 {len(failed_batches)}")
         parse_status = f"並行完成 {total_scenes - len(failed_batches)}/{total_scenes}"
@@ -887,8 +888,8 @@ class DirectorParser:
                 parse_status = f"序列重跑 {i+1}/{len(failed_scenes)}"
                 sn, scene_title, scene_body, scene_meta, segs = _process_scene(scene)
                 if segs is not None and scene_meta is not None:
-                    all_segments.extend(segs)
-                    all_scenes_meta.append(scene_meta)
+                    segments_map[sn] = segs
+                    scenes_meta_map[sn] = scene_meta
                     logger.info(f"  [Fallback] 場景 {sn} 重試成功：{len(segs)} 段")
                 else:
                     retry_failed.append(sn)
@@ -897,12 +898,19 @@ class DirectorParser:
             logger.info(f"[Fallback] 序列重跑完成，仍失敗 {len(failed_batches)}")
             parse_status = f"序列重跑完成"
 
-        if not all_segments:
+        if not segments_map:
             return ParseResult(
                 success=False,
                 error=f"分批解析失敗：所有 {total_scenes} 個場景均未產出有效段落",
                 retry_count=0,
             )
+
+        # 按 scene_number 排序後 flatten，確保順序與原始劇本一致
+        sorted_sns = sorted(segments_map.keys())
+        all_segments = []
+        for sn in sorted_sns:
+            all_segments.extend(segments_map[sn])
+        all_scenes_meta = [scenes_meta_map[sn] for sn in sorted_sns]
 
         # 組合為完整 v2 schema
         semantic_data = {"scenes": all_scenes_meta, "segments": all_segments}
