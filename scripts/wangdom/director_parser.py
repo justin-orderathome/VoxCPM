@@ -58,6 +58,26 @@ MAX_RETRIES = 3
 TST = timezone(timedelta(hours=8))  # 台北時區
 
 
+def _load_voice_profile_names() -> list[str]:
+    """載入 voice_profiles.yaml 中的角色完整名稱清單。"""
+    try:
+        import yaml as _yaml
+        vp_path = Path(__file__).parent.parent.parent / "profiles" / "voice_profiles.yaml"
+        if not vp_path.exists():
+            logger.warning(f"voice_profiles.yaml 不存在：{vp_path}")
+            return []
+        with open(vp_path, encoding="utf-8") as f:
+            data = _yaml.safe_load(f)
+        return list(data.get("voice_profiles", {}).keys())
+    except Exception as e:
+        logger.warning(f"載入 voice_profiles 失敗：{e}")
+        return []
+
+
+# 模組載入時讀取一次
+VOICE_PROFILE_NAMES: list[str] = _load_voice_profile_names()
+
+
 # ─── Frontmatter 解析 ─────────────────────────────────────
 
 def extract_frontmatter(script: str) -> Tuple[dict, str]:
@@ -431,6 +451,90 @@ def _build_full_json(
         "segments_total": len(segments),
         "scenes_total": len(scenes),
     }
+
+
+def _post_validate(data: dict, body: str) -> dict:
+    """後驗校稿：修正 speaker 簡稱、檢查 ambience / 台詞完整性。
+
+    修正清單：
+    1. speaker 模糊比對 → 正規化為 voice_profiles 中的完整官銜
+    2. ambience 標記一致性（日誌警告）
+    3. 台詞完整性檢查（日誌警告）
+
+    Args:
+        data: _build_full_json 產出的完整 v2 schema dict（會被就地修改）
+        body: 原始劇本 body 文本
+
+    Returns:
+        data（就地修改後回傳）
+    """
+    if not VOICE_PROFILE_NAMES:
+        logger.warning("[校稿] voice_profiles 未載入，跳過 speaker 校正")
+        return data
+
+    # ── 建立簡稱 → 完整名 對照表 ──
+    # 規則：取「·」後面的部分（如「禮部·紀曉嵐」→「紀曉嵐」）
+    alias_map: dict[str, str] = {}
+    for full_name in VOICE_PROFILE_NAMES:
+        alias_map[full_name] = full_name  # 自身也列入
+        if "·" in full_name:
+            short = full_name.split("·", 1)[1]
+            alias_map[short] = full_name
+
+    # ── 1. Speaker 正規化 ──
+    fixed_count = 0
+    for seg in data.get("segments", []):
+        speaker = seg.get("speaker", "")
+        if speaker in VOICE_PROFILE_NAMES:
+            continue  # 已正確
+
+        matched = alias_map.get(speaker)
+        if matched:
+            logger.info(f"[校稿] speaker 修正：{speaker} → {matched}（seg {seg.get('id')}）")
+            seg["speaker"] = matched
+            # 同步修正 voice.profile
+            if "voice" in seg:
+                seg["voice"]["profile"] = matched
+            fixed_count += 1
+        else:
+            logger.warning(f"[校稿] ⚠️ 無法匹配 speaker：{speaker}（seg {seg.get('id')}）")
+
+    if fixed_count:
+        logger.info(f"[校稿] 共修正 {fixed_count} 個 speaker")
+
+    # ── 2. Ambience 標記檢查 ──
+    # 從原始 body 提取所有音場標記
+    body_ambiences = re.findall(r"音場[：:]([^｜）\n]+)", body)
+    scene_ambiences = {}
+    for sc in data.get("scenes", []):
+        sn = sc.get("act_number", 0)
+        amb = sc.get("meta", {}).get("ambience", "")
+        scene_ambiences[sn] = amb.strip()
+
+    if body_ambiences:
+        logger.info(f"[校稿] 原始劇本音場標記：{body_ambiences}")
+        logger.info(f"[校稿] JSON 音場設定：{scene_ambiences}")
+
+    # ── 3. 台詞完整性抽查 ──
+    # 從 body 提取所有台詞行（emoji+角色：台詞），檢查是否在 segments 中有對應
+    dialogue_lines = re.findall(
+        r"[🌸📜🎤👑⚔️💰🎋🏔️📚🌸🔮⚖️🌊🐴🌙🍑💌][^\n：]*[：:]\s*(.+)",
+        body,
+    )
+    seg_texts = [seg.get("text", "") for seg in data.get("segments", []) if seg.get("type") == "dialogue"]
+
+    missing = []
+    for dl in dialogue_lines:
+        dl_clean = dl.strip()[:30]
+        if dl_clean and not any(dl_clean in st for st in seg_texts):
+            missing.append(dl_clean)
+
+    if missing:
+        logger.warning(f"[校稿] ⚠️ 可能有 {len(missing)} 段台詞未收入 segments：{missing[:5]}")
+    else:
+        logger.info("[校稿] 台詞完整性檢查通過")
+
+    return data
 
 
 def _call_llm(
@@ -808,13 +912,24 @@ class DirectorParser:
 
             logger.info(f"  場景 {sn}/{total_scenes}：「{scene_title[:30]}」（{len(scene_body)} 字）")
 
+            # 注入角色名規範，確保 LLM 使用完整官銜
+            speaker_hint = ""
+            if VOICE_PROFILE_NAMES:
+                speaker_lines = "\n".join(f"  - {name}" for name in VOICE_PROFILE_NAMES)
+                speaker_hint = f"""
+## 角色名規範（speaker 欄位必須使用以下完整名稱）
+{speaker_lines}
+
+如果你在劇本中看到簡稱（如「紀曉嵐」），必須對應為完整名稱（如「禮部·紀曉嵐」）。
+"""
+
             user_prompt = f"""請從以下場景中提取語義段落清單。
 
 ## 場景資訊
 - scene_number: {sn}
 - title: {scene_title}
 - narrator: {narrator}
-
+{speaker_hint}
 ## 場景內容
 ```
 {scene_body}
@@ -924,6 +1039,9 @@ class DirectorParser:
             transition_default=transition_default,
             body=body,
         )
+
+        # 後驗校稿：修正 speaker、檢查台詞完整性
+        _post_validate(full_data, body)
 
         # 最終 schema 驗證
         is_valid, errors = _validate_schema(full_data)
