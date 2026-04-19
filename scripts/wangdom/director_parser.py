@@ -42,6 +42,9 @@ if _wangdom_dir not in sys.path:
 logger = logging.getLogger("director_parser")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+# 全局解析狀態（供外部 heartbeat 輪詢）
+parse_status = ""
+
 
 # ─── 常量 ──────────────────────────────────────────────────
 
@@ -130,78 +133,70 @@ def _write_cache(cache_file: Path, data: dict) -> None:
 
 # ─── LLM 解析 ─────────────────────────────────────────────
 
-SYSTEM_PROMPT = """你是一位專業的廣播劇導演劇本解析器。你的任務是將 Markdown 格式的導演劇本解析為結構化 JSON。
+SEMANTIC_PROMPT = """你是一位廣播劇劇本語義解析器。你的任務是從 Markdown 導演劇本中提取語義段落清單。
 
 ## 輸入格式
 
-導演劇本是 Markdown 文件，包含：
-- YAML frontmatter（已提取，你只需處理 body）
-- 幕標題：【第X幕：名稱】或 ## 【第X幕：名稱】
+導演劇本是 Markdown 文件，body 部分包含：
+- 幕標題：## 【第X幕：名稱】
 - 場景 meta：（時間：...｜地點：...｜人物：...｜音場：...｜轉場：...）
-- 角色對話：{emoji} {角色名} [{演技標籤}]（{表演註記}）：\n{台詞}
-- 散文段落：無角色標頭的文本（由 narrator 朗讀）
-- 註解區塊：> 開頭或 <!-- --> 包裹
+- 角色對話：emoji + 角色名 + [演技標籤] +（表演註記）+ ：+ 台詞
+- 散文段落：無角色標頭的描述文本
+- 註解/引用塊（> 開頭）：不納入
 
-## 三種括號系統
+## 三種括號
 
-1. `（）` 全形括號 — 場景級 meta（獨立成行）或表演註記（角色標頭行中）
-2. `【】` 全形方括號 — 結構標記（幕/場標題）
-3. `[]` 半形方括號 — 行內演技標籤
+1. `（）` 全形 — 場景 meta（獨立行）或表演註記
+2. `【】` 全形 — 幕/場標題
+3. `[]` 半形 — 演技標籤
 
-## 解析規則
+## 你只需要輸出
 
-1. **段落類型判斷**：
-   - 有角色標頭（emoji + 角色名 + 冒號）→ type="dialogue"
-   - 無角色標頭的文本 → type="narration"，speaker 使用 frontmatter 的 narrator
+一個 JSON 陣列，每個元素代表一個段落，**只要這幾個欄位**：
 
-2. **Speaker 清理**：
-   - 移除開頭的 emoji
-   - 保留 `部門·角色名` 格式（如 `軍師·諸葛亮`）
-   - 移除 `[]` 演技標籤和 `（）` 表演註記
+```json
+{
+  "scene_number": 1,
+  "type": "dialogue",
+  "speaker": "待詔·唐伯虎",
+  "text": "台詞全文",
+  "expression_tags": ["laughing"],
+  "mood": "開心"
+}
+```
 
-3. **演技標籤抽取**：
-   - `[]` 內的短標籤直接作為 expression_tags
-   - `（）` 內的自然語言描述由你判斷 mood 值
+### 欄位說明
 
-4. **場景 meta 抽取**：
-   - 從 `（）` 獨立行中提取 time/location/characters/ambience/transition
-   - ambience 合法值：none, studio, hall, battle, rain, cave, wind, forest, crowd
-   - transition 合法值：none, chime, gong, drum, rain, laugh
+- `scene_number`：整數，遇到 ## 【第X幕】或 （場景 meta 獨立行）時遞增
+- `type`：`"dialogue"`（有角色標頭）或 `"narration"`（散文）
+- `speaker`：
+  - 對話段：移除 emoji，保留 `部門·角色名` 格式。移除 [] 和（）。例如 `🌸 唐伯虎 [laughing]（搖扇子）：` → `"待詔·唐伯虎"`
+  - 散文段：使用 frontmatter 的 narrator
+- `text`：完整台詞或散文原文，不改寫不省略
+- `expression_tags`：`[]` 半形標籤陣列，無則空陣列 `[]`
+- `mood`：從 `（）` 表演註記推斷的心情，無則 `null`
 
-5. **compile_mode 判斷**：
-   - 全篇只有對話 → "dialogue"
-   - 全篇只有散文 → "narration"
-   - 兩者混合 → "mixed"
+### 場景列表
 
-6. **ID 與序號**：
-   - segment.id 全劇遞增，從 1 開始
-   - scene.act_number 從 1 開始遞增
-   - segment.scene_number 對應所屬場景的 act_number
+同時在陣列之前，輸出 `scenes` 陣列：
 
-7. **轉場音效**：
-   - 僅每幕第一段設定 transition（從場景 meta 取得）
-   - 其他段 transition 為 null
+```json
+{
+  "scenes": [
+    {"scene_number": 1, "title": "第一幕：七項的變遷", "ambience": "studio", "transition": "chime"}
+  ],
+  "segments": [...]
+}
+```
 
-8. **timing 預設**：
-   - pause_before: 0.0
-   - pause_after: 0.5（散文段落 1.0）
+## 規則
 
-9. **voice.ambience**：
-   - 從場景 meta 取得，無 meta 時使用 frontmatter 的 ambience_default
-
-10. **字幕**：
-    - subtitle.text = segment.text 的完整文字
-    - lead_time_ms = 0（默認）
-    - display_mode = "timed"
-
-## 注意事項
-
-- 不要遺漏任何段落（包括散文段落）
-- 散文段落即使跨多行，也合併為一個 segment
-- 角色台詞多行也合併為一個 segment（至空行結束）
-- 註解、引用塊（>）、HTML 註解（<!-- -->）不納入 segments
-- 保持原文，不要改寫或省略任何文字內容
-- characters 欄位為角色名列表（不含 emoji），逗號分隔轉陣列"""
+- 不要遺漏任何段落（含散文）
+- 散文多行合併為一個 segment
+- 台詞多行也合併（到空行結束）
+- 註解（> 開頭）、引用塊、HTML 註解、取材來源、簽名行不納入
+- **只輸出 JSON，不要其他文字**
+- 輸出用 ```json 包裹"""
 
 RETRY_PROMPT_TEMPLATE = """上一次解析結果有錯誤，請修正。
 
@@ -219,6 +214,223 @@ RETRY_PROMPT_TEMPLATE = """上一次解析結果有錯誤，請修正。
 {errors}
 
 請修正上述錯誤，重新輸出完整的 JSON。只輸出 JSON，不要其他文字。"""
+
+
+def _split_by_scenes(body: str) -> List[dict]:
+    """將 body 按場景邊界分割為多個場景區塊。
+
+    分批錨點（優先序）：
+    1. 場景 meta 獨立行：`（時間：...｜...）`  — 最穩定，100% 出現
+    2. 幕/段子標題：`## 【...】`              — 次穩定
+
+    每個區塊 = 從一個錨點到下一個錨點之間的所有內容。
+    第一批包含 preamble（標題區/引用區）。
+
+    Returns:
+        [{"scene_number": N, "title": "...", "body": "..."}]
+    """
+    lines = body.split("\n")
+
+    # 找出所有場景邊界行
+    boundaries = []  # (line_index, title)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # 錨點 1：場景 meta 獨立行（以「（時間」或「（音場」開頭）
+        if stripped.startswith("（") and stripped.endswith("）") and "：" in stripped:
+            # 向上找幕標題（如果有的話）
+            title = ""
+            for j in range(i - 1, max(i - 5, -1), -1):
+                prev = lines[j].strip()
+                if prev.startswith("## 【") and "】" in prev:
+                    title = prev.lstrip("#").strip().strip("【】")
+                    break
+            if not title:
+                # 從 meta 行中提取地點作為 title
+                loc_match = re.search(r"地點：([^｜）]+)", stripped)
+                title = loc_match.group(1).strip() if loc_match else f"場景{len(boundaries)+1}"
+            boundaries.append((i, title))
+
+        # 錨點 2：幕/段子標題（僅在沒有緊接的場景 meta 時作為錨點）
+        elif stripped.startswith("## 【") and "】" in stripped:
+            # 檢查下一行是否為場景 meta（如果是，meta 才是錨點）
+            next_content = ""
+            for j in range(i + 1, min(i + 3, len(lines))):
+                if lines[j].strip():
+                    next_content = lines[j].strip()
+                    break
+            if next_content.startswith("（") and next_content.endswith("）"):
+                continue  # 讓 meta 行當錨點
+            act_title = stripped.lstrip("#").strip().strip("【】")
+            boundaries.append((i, act_title))
+
+    # 沒有任何邊界 → 整份當一個場景
+    if not boundaries:
+        return [{"scene_number": 1, "title": "全劇", "body": body}]
+
+    # 切割：第一批 = 開頭到第一個邊界
+    chunks = []
+    first_boundary_line = boundaries[0][0]
+    preamble = "\n".join(lines[:first_boundary_line]).strip()
+    if preamble:
+        chunks.append({"scene_number": 0, "title": "preamble", "body": preamble})
+
+    # 逐段切割
+    for idx, (start_line, title) in enumerate(boundaries):
+        if idx + 1 < len(boundaries):
+            end_line = boundaries[idx + 1][0]
+        else:
+            end_line = len(lines)
+        chunk_body = "\n".join(lines[start_line:end_line]).strip()
+        if chunk_body:
+            chunks.append({
+                "scene_number": idx + 1,
+                "title": title,
+                "body": chunk_body,
+            })
+
+    # 如果 preamble 存在，併入第一批
+    if chunks and chunks[0]["scene_number"] == 0:
+        if len(chunks) > 1:
+            chunks[1]["body"] = chunks[0]["body"] + "\n\n" + chunks[1]["body"]
+            chunks.pop(0)
+        else:
+            chunks[0]["scene_number"] = 1
+
+    # 重新編號
+    for i, chunk in enumerate(chunks):
+        chunk["scene_number"] = i + 1
+
+    return chunks
+
+
+def _build_full_json(
+    semantic_data: dict,
+    meta: dict,
+    title: str,
+    date_str: str,
+    narrator: str,
+    ambience_default: str,
+    transition_default: str,
+    body: str,
+) -> dict:
+    """將 LLM 輸出的語義 JSON 補完為完整 director-script/v2 schema。
+
+    LLM 只需輸出 scenes[] + segments[] 的語義欄位，
+    此函式負責補完所有格式欄位（id, timing, voice, subtitle, scene 關聯）。
+    """
+    raw_scenes = semantic_data.get("scenes", [])
+    raw_segments = semantic_data.get("segments", [])
+
+    # 判斷 compile_mode
+    has_dialogue = any(s.get("type") == "dialogue" for s in raw_segments)
+    has_narration = any(s.get("type") == "narration" for s in raw_segments)
+    if has_dialogue and has_narration:
+        compile_mode = "mixed"
+    elif has_dialogue:
+        compile_mode = "dialogue"
+    else:
+        compile_mode = "narration"
+
+    # 建構 scenes（完整 schema）
+    scenes = []
+    scene_segment_ids = {}  # scene_number -> [segment_ids]
+    for raw_scene in raw_scenes:
+        sn = raw_scene.get("scene_number", len(scenes) + 1)
+        scene_segment_ids[sn] = []
+        scenes.append({
+            "act_number": sn,
+            "act_title": raw_scene.get("title", f"第{sn}幕"),
+            "meta": {
+                "ambience": raw_scene.get("ambience", ambience_default),
+                "transition": raw_scene.get("transition", transition_default),
+            },
+            "segment_ids": [],  # 稍後填入
+        })
+
+    # 如果 LLM 沒輸出 scenes，從 segments 的 scene_number 自動推斷
+    if not scenes:
+        scene_numbers_seen = sorted(set(
+            s.get("scene_number", 1) for s in raw_segments
+        ))
+        for sn in scene_numbers_seen:
+            scene_segment_ids[sn] = []
+            scenes.append({
+                "act_number": sn,
+                "act_title": f"第{sn}幕",
+                "meta": {
+                    "ambience": ambience_default,
+                    "transition": transition_default,
+                },
+                "segment_ids": [],
+            })
+
+    # 建構 segments（完整 schema）
+    segments = []
+    for idx, raw_seg in enumerate(raw_segments):
+        seg_id = idx + 1
+        scene_num = raw_seg.get("scene_number", 1)
+        seg_type = raw_seg.get("type", "dialogue")
+
+        # 找出此段所屬 scene 的 ambience
+        scene_ambience = ambience_default
+        for sc in scenes:
+            if sc["act_number"] == scene_num:
+                scene_ambience = sc["meta"].get("ambience", ambience_default)
+                break
+
+        segment = {
+            "id": seg_id,
+            "type": seg_type,
+            "speaker": raw_seg.get("speaker", narrator),
+            "text": raw_seg.get("text", ""),
+            "scene_number": scene_num,
+            "timing": {
+                "pause_before": 0.0,
+                "pause_after": 1.0 if seg_type == "narration" else 0.5,
+            },
+            "voice": {
+                "profile": raw_seg.get("speaker", narrator),
+                "ambience": scene_ambience,
+                "sample_rate": 48000,
+                "mood": raw_seg.get("mood"),
+                "expression_tags": raw_seg.get("expression_tags", []),
+            },
+            "subtitle": {
+                "text": raw_seg.get("text", ""),
+                "lead_time_ms": 0,
+                "display_mode": "timed",
+            },
+        }
+        segments.append(segment)
+
+        # 記錄 segment -> scene 對應
+        if scene_num in scene_segment_ids:
+            scene_segment_ids[scene_num].append(seg_id)
+
+    # 回填 scene 的 segment_ids
+    for sc in scenes:
+        sn = sc["act_number"]
+        sc["segment_ids"] = scene_segment_ids.get(sn, [])
+
+    return {
+        "schema_version": "director-script/v2",
+        "compile_mode": compile_mode,
+        "title": title,
+        "date": date_str,
+        "source": {
+            "file": "導演劇本.md",
+            "generated_at": datetime.now(TST).isoformat(),
+            "parser": "director-parser/v2-semantic",
+            "cache_hit": False,
+            "retry_count": 0,
+        },
+        "frontmatter": meta,
+        "scenes": scenes,
+        "segments": segments,
+        "segments_total": len(segments),
+        "scenes_total": len(scenes),
+    }
 
 
 def _call_llm(
@@ -264,14 +476,47 @@ def _call_llm(
     )
 
     content = response.choices[0].message.content or ""
+
+    # 空:回應自動重試（glm-5-turbo 偶發空輸出）
+    if not content.strip():
+        logger.warning("LLM 回應為空，立即重試...")
+        for _retry in range(2):
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = response.choices[0].message.content or ""
+                if content.strip():
+                    break
+            except Exception:
+                continue
+
+    # 確保 frontmatter 中的 date 可序列化
     return content.strip()
 
 
 def _extract_json_from_response(text: str) -> Optional[dict]:
-    """從 LLM 回應中提取 JSON（處理 markdown code block 包裹）"""
+    """從 LLM 回應中提取 JSON（處理 markdown code block 包裹）
+
+    支援格式：
+    1. 純 JSON（直接是 dict 或 list）
+    2. ```json ... ``` code block
+    3. 混合文字中的 JSON 物件/陣列
+    """
     # 嘗試 1：直接解析
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            # LLM 可能直接輸出 segments 陣列 → 包裝為 dict
+            return {"segments": parsed}
     except json.JSONDecodeError:
         pass
 
@@ -279,7 +524,11 @@ def _extract_json_from_response(text: str) -> Optional[dict]:
     m = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
     if m:
         try:
-            return json.loads(m.group(1))
+            parsed = json.loads(m.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+            if isinstance(parsed, list):
+                return {"segments": parsed}
         except json.JSONDecodeError:
             pass
 
@@ -288,10 +537,24 @@ def _extract_json_from_response(text: str) -> Optional[dict]:
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(text[start:end + 1])
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
 
+    # 嘗試 4：找最外層 [ ... ]（LLM 直接輸出陣列）
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(text[start:end + 1])
+            if isinstance(parsed, list):
+                return {"segments": parsed}
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning(f"JSON 提取失敗，回應前 500 字：{text[:500]}")
     return None
 
 
@@ -507,8 +770,180 @@ class DirectorParser:
         transition_default: str,
         script_dir: Optional[str | Path] = None,
     ) -> ParseResult:
-        """LLM 解析 + 自動調教循環"""
-        user_prompt = f"""請解析以下導演劇本 body 為結構化 JSON。
+        """分批語義解析 → 組合 v2 schema。
+
+        策略：
+        1. _split_by_scenes() 按場景邊界分批
+        2. 每批獨立呼叫 LLM（輕量語義 JSON）
+        3. 收集所有批次的 segments
+        4. _build_full_json() 統一補完 v2 schema
+        """
+        scenes = _split_by_scenes(body)
+        total_scenes = len(scenes)
+
+        if total_scenes == 0:
+            return ParseResult(success=False, error="body 為空，無法分批", retry_count=0)
+
+        # 如果只有一個場景 → 走單次呼叫（不分批）
+        if total_scenes == 1:
+            return self._parse_single_scene(
+                body, meta, title, date_str, narrator,
+                ambience_default, transition_default,
+            )
+
+        # 分批解析
+        logger.info(f"分批解析：{total_scenes} 個場景")
+        all_segments = []
+        all_scenes_meta = []
+        failed_batches = []
+
+        # ── 並行處理每個場景 ──
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _process_scene(scene: dict) -> tuple[int, str, str, dict | None, list | None]:
+            """處理單一場景，回傳 (sn, title, body, scene_meta, segments)"""
+            sn = scene["scene_number"]
+            scene_title = scene["title"]
+            scene_body = scene["body"]
+
+            logger.info(f"  場景 {sn}/{total_scenes}：「{scene_title[:30]}」（{len(scene_body)} 字）")
+
+            user_prompt = f"""請從以下場景中提取語義段落清單。
+
+## 場景資訊
+- scene_number: {sn}
+- title: {scene_title}
+- narrator: {narrator}
+
+## 場景內容
+```
+{scene_body}
+```
+
+請輸出 JSON 陣列（segments），每個元素含 scene_number, type, speaker, text, expression_tags, mood。只輸出 JSON。"""
+
+            try:
+                response_text = _call_llm(
+                    SEMANTIC_PROMPT, user_prompt,
+                    model=self.model,
+                    max_tokens=8192,
+                )
+            except Exception as e:
+                logger.warning(f"  場景 {sn} LLM 呼叫失敗：{e}")
+                return (sn, scene_title, scene_body, None, None)
+
+            scene_data = _extract_json_from_response(response_text)
+            if scene_data is None:
+                logger.warning(f"  場景 {sn} JSON 提取失敗")
+                return (sn, scene_title, scene_body, None, None)
+
+            segs = scene_data if isinstance(scene_data, list) else scene_data.get("segments", [])
+            if not isinstance(segs, list) or len(segs) == 0:
+                logger.warning(f"  場景 {sn} segments 為空")
+                return (sn, scene_title, scene_body, None, None)
+
+            # 統一 scene_number
+            for seg in segs:
+                seg["scene_number"] = sn
+
+            # 場景 meta
+            scene_meta = {"scene_number": sn, "title": scene_title}
+            amb_match = re.search(r"音場[：:]([^｜）]+)", scene_body)
+            trans_match = re.search(r"轉場[：:]([^｜）]+)", scene_body)
+            if amb_match:
+                scene_meta["ambience"] = amb_match.group(1).strip()
+            if trans_match:
+                scene_meta["transition"] = trans_match.group(1).strip()
+
+            logger.info(f"  場景 {sn} 完成：{len(segs)} 段")
+            return (sn, scene_title, scene_body, scene_meta, segs)
+
+        # ── 第一輪：並行 ──
+        logger.info(f"[並行] 同時處理 {len(scenes)} 個場景")
+        global parse_status
+        parse_status = f"並行解析 0/{total_scenes}"
+        with ThreadPoolExecutor(max_workers=len(scenes)) as pool:
+            futures = {pool.submit(_process_scene, s): s for s in scenes}
+            for future in as_completed(futures):
+                sn, scene_title, scene_body, scene_meta, segs = future.result()
+                if segs is not None and scene_meta is not None:
+                    all_segments.extend(segs)
+                    all_scenes_meta.append(scene_meta)
+                else:
+                    failed_batches.append(sn)
+                parse_status = f"並行解析 {len(all_scenes_meta)}/{total_scenes}"
+
+        logger.info(f"[並行] 完成 {total_scenes - len(failed_batches)}/{total_scenes}，失敗 {len(failed_batches)}")
+        parse_status = f"並行完成 {total_scenes - len(failed_batches)}/{total_scenes}"
+
+        # ── 第二輪：序列 fallback（並行失敗數 ≥ 3 時觸發）──
+        FALLBACK_THRESHOLD = 3
+        if len(failed_batches) >= FALLBACK_THRESHOLD:
+            logger.warning(f"[Fallback] 並行失敗 {len(failed_batches)} ≥ {FALLBACK_THRESHOLD}，降為序列重跑")
+            parse_status = f"序列重跑 {len(failed_batches)} 場失敗場景"
+            failed_scenes = [s for s in scenes if s["scene_number"] in failed_batches]
+            retry_failed = []
+            for i, scene in enumerate(failed_scenes):
+                parse_status = f"序列重跑 {i+1}/{len(failed_scenes)}"
+                sn, scene_title, scene_body, scene_meta, segs = _process_scene(scene)
+                if segs is not None and scene_meta is not None:
+                    all_segments.extend(segs)
+                    all_scenes_meta.append(scene_meta)
+                    logger.info(f"  [Fallback] 場景 {sn} 重試成功：{len(segs)} 段")
+                else:
+                    retry_failed.append(sn)
+
+            failed_batches = retry_failed
+            logger.info(f"[Fallback] 序列重跑完成，仍失敗 {len(failed_batches)}")
+            parse_status = f"序列重跑完成"
+
+        if not all_segments:
+            return ParseResult(
+                success=False,
+                error=f"分批解析失敗：所有 {total_scenes} 個場景均未產出有效段落",
+                retry_count=0,
+            )
+
+        # 組合為完整 v2 schema
+        semantic_data = {"scenes": all_scenes_meta, "segments": all_segments}
+        full_data = _build_full_json(
+            semantic_data=semantic_data,
+            meta=meta,
+            title=title,
+            date_str=date_str,
+            narrator=narrator,
+            ambience_default=ambience_default,
+            transition_default=transition_default,
+            body=body,
+        )
+
+        # 最終 schema 驗證
+        is_valid, errors = _validate_schema(full_data)
+        if is_valid:
+            note = f"（場景 {failed_batches} 失敗）" if failed_batches else ""
+            logger.info(f"分批解析完成：{len(all_segments)} 段 / {total_scenes} 場景{note}")
+            return ParseResult(success=True, data=full_data, retry_count=0)
+        else:
+            logger.warning(f"schema 補完後仍有 {len(errors)} 項錯誤：{errors[:5]}")
+            # 嘗試 fallback 到單次解析
+            logger.info("嘗試 fallback 單次解析...")
+            return self._parse_single_scene(
+                body, meta, title, date_str, narrator,
+                ambience_default, transition_default,
+            )
+
+    def _parse_single_scene(
+        self,
+        body: str,
+        meta: dict,
+        title: str,
+        date_str: str,
+        narrator: str,
+        ambience_default: str,
+        transition_default: str,
+    ) -> ParseResult:
+        """單次 LLM 呼叫（不分批），用於場景數 ≤ 1 或 fallback。"""
+        user_prompt = f"""請從以下導演劇本 body 中提取語義段落清單。
 
 ## Frontmatter 資訊（已提取）
 - title: {title}
@@ -522,30 +957,47 @@ class DirectorParser:
 {body}
 ```
 
-請輸出完整的 JSON（符合 director-script/v2 schema）。只輸出 JSON，不要其他文字。"""
+請輸出 JSON（含 scenes 陣列 + segments 陣列，只需語義欄位）。只輸出 JSON。"""
 
         previous_output: Optional[str] = None
         _last_errors: List[str] = []
 
         for attempt in range(1, self.max_retries + 1):
-            logger.info(f"LLM 解析第 {attempt} 次（model={self.model}）")
+            logger.info(f"LLM 單次解析第 {attempt} 次（model={self.model}）")
 
             try:
                 if attempt == 1:
-                    response_text = _call_llm(SYSTEM_PROMPT, user_prompt, model=self.model)
-                else:
-                    # 構建重試 prompt（上次的錯誤回饋）
-                    retry_prompt = RETRY_PROMPT_TEMPLATE.format(
-                        body=body,
-                        previous_output=previous_output or "",
-                        errors="\n".join(f"- {e}" for e in _last_errors),
+                    response_text = _call_llm(
+                        SEMANTIC_PROMPT, user_prompt,
+                        model=self.model,
+                        max_tokens=8192,
                     )
-                    response_text = _call_llm(SYSTEM_PROMPT, retry_prompt, model=self.model)
+                else:
+                    retry_prompt = f"""上一次提取結果有誤，請修正。
 
+## 導演劇本 Body
+```
+{body}
+```
+
+## 上次輸出（有誤）
+```
+{previous_output or ""}
+```
+
+## 錯誤
+{chr(10).join(f"- {e}" for e in _last_errors)}
+
+請重新輸出 JSON（含 scenes + segments）。只輸出 JSON。"""
+                    response_text = _call_llm(
+                        SEMANTIC_PROMPT, retry_prompt,
+                        model=self.model,
+                        max_tokens=8192,
+                    )
             except Exception as e:
                 logger.error(f"LLM API 呼叫失敗（attempt {attempt}）：{e}")
                 if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)  # 指數退避
+                    time.sleep(2 ** attempt)
                     continue
                 return ParseResult(
                     success=False,
@@ -553,41 +1005,53 @@ class DirectorParser:
                     retry_count=attempt,
                 )
 
-            # 提取 JSON
-            data = _extract_json_from_response(response_text)
-            if data is None:
+            semantic_data = _extract_json_from_response(response_text)
+            if semantic_data is None:
                 logger.warning(f"attempt {attempt}：無法從回應中提取 JSON")
                 previous_output = response_text
-                _last_errors = ["無法解析為有效 JSON，回應可能包含非 JSON 文字"]
+                _last_errors = ["無法解析為有效 JSON"]
                 continue
 
-            # 填充來源資訊
-            data["source"] = {
-                "file": "導演劇本.md",
-                "generated_at": datetime.now(TST).isoformat(),
-                "parser": "director-parser/v2",
-                "cache_hit": False,
-                "retry_count": attempt,
-            }
+            if "segments" not in semantic_data or not isinstance(semantic_data.get("segments"), list):
+                # 可能 LLM 直接輸出了 segments 陣列
+                if isinstance(semantic_data.get("segments"), list) and len(semantic_data["segments"]) == 0:
+                    logger.warning(f"attempt {attempt}：segments 為空")
+                    previous_output = response_text
+                    _last_errors = ["segments 陣列為空"]
+                    continue
 
-            # Schema 驗證
-            is_valid, errors = _validate_schema(data)
+            raw_segments = semantic_data.get("segments", [])
+            if len(raw_segments) == 0:
+                logger.warning(f"attempt {attempt}：segments 為空")
+                previous_output = response_text
+                _last_errors = ["未提取到任何段落"]
+                continue
+
+            full_data = _build_full_json(
+                semantic_data=semantic_data,
+                meta=meta,
+                title=title,
+                date_str=date_str,
+                narrator=narrator,
+                ambience_default=ambience_default,
+                transition_default=transition_default,
+                body=body,
+            )
+            full_data["source"]["retry_count"] = attempt - 1
+
+            is_valid, errors = _validate_schema(full_data)
             if is_valid:
-                logger.info(f"LLM 解析成功（attempt {attempt}），共 {len(data.get('segments', []))} 段")
-                return ParseResult(
-                    success=True,
-                    data=data,
-                    retry_count=attempt - 1,
-                )
+                logger.info(f"LLM 單次解析成功（attempt {attempt}），{len(raw_segments)} 段")
+                return ParseResult(success=True, data=full_data, retry_count=attempt - 1)
             else:
-                logger.warning(f"attempt {attempt}：schema 驗證失敗（{len(errors)} 項錯誤）")
-                previous_output = json.dumps(data, ensure_ascii=False, indent=2)
-                _last_errors = errors
+                logger.warning(f"attempt {attempt}：schema 補完後仍有 {len(errors)} 項錯誤")
+                previous_output = response_text
+                _last_errors = errors[:5]
                 continue
 
         return ParseResult(
             success=False,
-            error=f"LLM 解析失敗（{self.max_retries} 次重試後仍有 schema 錯誤）",
+            error=f"LLM 語義解析失敗（{self.max_retries} 次重試後仍無法提取有效段落）",
             retry_count=self.max_retries,
         )
 
@@ -698,7 +1162,7 @@ def parse_director_script(
 def save_voice_json(data: dict, output_path: str | Path) -> None:
     """將解析結果存為語音版 JSON"""
     Path(output_path).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
+        json.dumps(data, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
 

@@ -57,6 +57,7 @@ from voxcpm_skill import VoiceProfileManager
 from style_compiler import compile_text
 from audio_post import post_process
 from director_parser import parse_director_script, save_voice_json
+import director_parser as _dp
 
 
 
@@ -2134,9 +2135,13 @@ async def cmd_drama(ctx, *, args: str = ""):
                         if elapsed >= threshold:
                             tip = msg
                     try:
-                        await status_msg.edit(
-                            content=f"📜 LLM 解析中… ⏳ {elapsed}s{f'（{tip}）' if tip else ''}"
-                        )
+                        ps = _dp.parse_status
+                        status_text = f"📜 LLM 解析中… ⏳ {elapsed}s"
+                        if ps:
+                            status_text += f" | {ps}"
+                        if tip:
+                            status_text += f"（{tip}）"
+                        await status_msg.edit(content=status_text)
                     except Exception:
                         break
                     await asyncio.sleep(5)
