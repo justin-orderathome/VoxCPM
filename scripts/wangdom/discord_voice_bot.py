@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""崴勝王朝 · 獨立語音 Bot（常駐模型 + 真串流）
+"""鼎勝王朝 · 獨立語音 Bot（雙引擎 + 真串流）
 
 功能：
   - Discord 語音頻道串流播放（generate_streaming 逐 chunk）
   - 檔案模式輸出（MP3/WAV）
   - 所有語音輸出同步發送文字版
-  - VoxCPM 模型常駐（啟動載入一次）
+  - 雙 TTS 引擎：IndexTTS2（預設）/ VoxCPM2 / Edge TTS
+  - !engine 切換引擎，VRAM 互斥自動停啟 Docker
   - GPU 互斥鎖：串流/檔案生成排隊，不互踩
   - !stop 可中斷串流並回收資源
 """
@@ -58,6 +59,7 @@ from style_compiler import compile_text
 from audio_post import post_process
 from director_parser import parse_director_script, save_voice_json
 import director_parser as _dp
+import indextts2_client
 
 
 
@@ -152,7 +154,7 @@ def _strip_leading_emoji(text: str) -> str:
             break
     return text[i:].strip()
 
-DRAMA_VAULT_ROOT = Path(os.environ.get("VAULT_PATH", str(Path.home() / "projects" / "second-brain-clerk"))) / "wiki" / "崴勝王朝" / "趣聞閣"
+DRAMA_VAULT_ROOT = Path(os.environ.get("VAULT_PATH", str(Path.home() / "projects" / "second-brain-clerk"))) / "wiki" / "鼎勝王朝" / "趣聞閣"
 SPEAKER_ALIAS = {
     "主公": "主公·劉邦",
     "諸葛亮": "軍師·諸葛亮",
@@ -651,9 +653,102 @@ _active_streams: dict[int, ActiveStream] = {}
 _task_counter = itertools.count(1)
 _morning_scheduler_task: Optional[asyncio.Task] = None
 
+# ---------------------------------------------------------------------------
+# 雙引擎狀態
+# ---------------------------------------------------------------------------
+_current_engine = "indextts"  # indextts | voxcpm | edge
+_engine_switch_lock = threading.Lock()  # 防止並行切換
+
 
 def _next_task_id(prefix: str = "T") -> str:
     return f"{prefix}{next(_task_counter):04d}"
+
+
+# ---------------------------------------------------------------------------
+# 引擎分派層
+# ---------------------------------------------------------------------------
+
+def _synth_dispatch(
+    text: str,
+    character: str,
+    output_path: str | Path,
+    mood: Optional[str] = None,
+    ambience: str = "none",
+    output_format: str = "wav",
+) -> dict:
+    """統一合成分派（sync，可在 thread 中呼叫）。失敗不在此 fallback，由上層處理。"""
+    if _current_engine == "indextts":
+        return indextts2_client.synthesize(
+            text=text, character=character, output_path=output_path,
+            mood=mood, output_format=output_format,
+        )
+    elif _current_engine == "voxcpm":
+        return _engine.synthesize_file(
+            text=text, character=character, output_path=output_path,
+            mood=mood, ambience=ambience, output_format=output_format,
+        )
+    else:  # edge
+        return _engine.synthesize_with_edge(text=text, character=character, output_path=output_path)
+
+
+def _synth_with_fallback(
+    text: str,
+    character: str,
+    output_path: str | Path,
+    mood: Optional[str] = None,
+    ambience: str = "none",
+    output_format: str = "wav",
+) -> dict:
+    """合成 + 自動 fallback Edge TTS。"""
+    result = _synth_dispatch(text, character, output_path, mood, ambience, output_format)
+    if result.get("ok"):
+        return result
+
+    # Fallback Edge TTS
+    print(f"[engine] ⚠️ {_current_engine} 合成失敗: {result.get('reason', '?')}，fallback Edge TTS")
+    edge_out = Path(output_path)
+    if output_format == "mp3" and edge_out.suffix.lower() != ".mp3":
+        edge_out = edge_out.with_suffix(".mp3")
+    elif edge_out.suffix.lower() not in (".mp3", ".wav"):
+        edge_out = edge_out.with_suffix(".mp3")
+
+    edge_result = _engine.synthesize_with_edge(text=text, character=character, output_path=str(edge_out))
+    if edge_result.get("ok"):
+        edge_result["fallback_from"] = f"{_current_engine}_error: {result.get('reason', '')}"
+    return edge_result
+
+
+def _ensure_engine_ready() -> bool:
+    """確保當前引擎後端就緒（sync，可在 thread 中呼叫）。"""
+    if _current_engine == "indextts":
+        r = indextts2_client.ensure_running(timeout=180)
+        return r.get("ok", False)
+    elif _current_engine == "voxcpm":
+        try:
+            _engine.load_model()
+            return True
+        except Exception as e:
+            print(f"[engine] ⚠️ VoxCPM2 載入失敗: {e}")
+            return False
+    else:  # edge — 永遠就緒
+        return True
+
+
+def _unload_voxcpm():
+    """卸載 VoxCPM2 模型釋放 VRAM。"""
+    if _engine.model_loaded:
+        try:
+            del _engine._model
+        except Exception:
+            pass
+        _engine._model = None
+        try:
+            import gc, torch
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("[engine] VoxCPM2 模型已卸載，VRAM 已釋放")
 
 
 # ---------------------------------------------------------------------------
@@ -1312,7 +1407,7 @@ def _render_drama_audio(
                 print(f"[drama] fallback voice: {seg['speaker']} -> {voice_speaker} (seg {i+1}/{len(segments)})")
             print(f"[drama] >>> synth start seg {i+1}/{len(segments)} {seg['speaker']} (voice={voice_speaker})")
             try:
-                res = _engine.synthesize_file(
+                res = _synth_with_fallback(
                     text=seg["text"],
                     character=voice_speaker,
                     output_path=seg_path,
@@ -1505,18 +1600,50 @@ async def _synthesize_and_play_stream(
 
     def _producer():
         try:
-            for chunk in _engine.stream_chunks(
-                text=text,
-                character=character,
-                mood=mood,
-                expression_tags=None,
-                stop_event=stop_event,
-                ambience=ambience,
-            ):
-                if stop_event.is_set():
-                    break
-                pcm = mono_float_to_pcm_s16le_stereo(chunk, sample_rate=_engine.out_sample_rate)
-                source.put_data(pcm)
+            if _current_engine == "indextts":
+                # IndexTTS2 無串流 API：先整段合成再 yield chunks
+                import gc
+                synth_result = indextts2_client.synthesize(
+                    text=text, character=character, output_path="_stream_tmp_",
+                    mood=mood, output_format="wav",
+                )
+                if not synth_result.get("ok"):
+                    raise RuntimeError(f"IndexTTS2 合成失敗: {synth_result.get('reason')}")
+                wav_path = synth_result["output_path"]
+                audio, sr = sf.read(wav_path, dtype="float32")
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                if sr != 48000:
+                    audio = _resample_audio(audio, sr, 48000)
+                audio = normalize_rms(audio, target_rms=0.08)
+                # 清理暫存
+                try:
+                    Path(wav_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                # 逐 chunk yield
+                chunk_size = int(48000 * 0.5)  # 0.5s chunks
+                for i in range(0, len(audio), chunk_size):
+                    if stop_event and stop_event.is_set():
+                        break
+                    source.put_data(
+                        mono_float_to_pcm_s16le_stereo(audio[i:i+chunk_size], 48000)
+                    )
+            elif _current_engine == "voxcpm":
+                for chunk in _engine.stream_chunks(
+                    text=text,
+                    character=character,
+                    mood=mood,
+                    expression_tags=None,
+                    stop_event=stop_event,
+                    ambience=ambience,
+                ):
+                    if stop_event and stop_event.is_set():
+                        break
+                    pcm = mono_float_to_pcm_s16le_stereo(chunk, sample_rate=_engine.out_sample_rate)
+                    source.put_data(pcm)
+            else:  # edge — 不支援串流，fallback 檔案模式
+                raise RuntimeError("Edge TTS 不支援串流模式，請用檔案模式")
         except Exception as e:
             source.set_error(str(e))
         finally:
@@ -1579,7 +1706,7 @@ async def _synthesize_and_send_file(ctx, character: str, text: str, mood=None, a
 
     result = await asyncio.get_running_loop().run_in_executor(
         None,
-        lambda: _engine.synthesize_file(
+        lambda: _synth_with_fallback(
             text=text,
             character=character,
             output_path=out_path,
@@ -1634,7 +1761,8 @@ async def on_ready():
 
     print(f"✅ 王朝語音 Bot 已上線：{bot.user}")
     print(f"   輸出模式：{_router.default_mode}")
-    print("   VRAM 策略：常駐模型（啟動載入一次）")
+    print(f"   VRAM 策略：按需載入（預設 IndexTTS2）")
+    print(f"   當前引擎：{_current_engine}")
     try:
         synced = await bot.tree.sync()
         print(f"   Slash 指令已同步：{len(synced)}")
@@ -1872,7 +2000,8 @@ async def cmd_status(ctx):
         f"  語音頻道：`{ctx.voice_client.channel.name if ctx.voice_client else '未連接'}`",
         f"  播放中：`{'是' if ctx.voice_client and ctx.voice_client.is_playing() else '否'}`",
         f"  輸出模式：`{_router.default_mode}`",
-        f"  引擎：`常駐 VoxCPM + Edge fallback`",
+        f"  引擎：`{_current_engine}`",
+        f"  IndexTTS2：`{'✅ 運行中' if indextts2_client.healthcheck() else '❌ 未啟動'}`",
         f"  模型載入：`{'是' if _engine.model_loaded else '否'}`",
         f"  佇列：`busy={snap['busy']}, waiting={snap['waiting']}`",
         f"  執行中：`{snap['active_job'] or '無'}`",
@@ -1938,6 +2067,7 @@ async def slash_status(interaction: discord.Interaction):
         f"  Bot：`{bot.user}`",
         f"  語音頻道：`{vc.channel.name if vc else '未連接'}`",
         f"  播放中：`{'是' if vc and vc.is_playing() else '否'}`",
+        f"  引擎：`{_current_engine}`",
         f"  模型載入：`{'是' if _engine.model_loaded else '否'}`",
         f"  佇列：`busy={snap['busy']}, waiting={snap['waiting']}`",
         f"  執行中：`{snap['active_job'] or '無'}`",
@@ -2084,6 +2214,98 @@ async def cmd_greeting(ctx, *, args: str = ""):
         except Exception:
             pass
 
+
+# ---------------------------------------------------------------------------
+# !engine — 引擎切換
+# ---------------------------------------------------------------------------
+
+@bot.command(name="engine")
+async def cmd_engine(ctx, engine_name: str = ""):
+    """切換 TTS 引擎：!engine [indextts|voxcpm|edge]"""
+    global _current_engine
+
+    if not engine_name.strip():
+        # 查詢狀態
+        indextts_ok = indextts2_client.healthcheck()
+        voxcpm_loaded = _engine.model_loaded
+        lines = [
+            f"🔧 **當前引擎：`{_current_engine}`**",
+            "",
+            f"  IndexTTS2 Docker：{'✅ 運行中' if indextts_ok else '❌ 未啟動'}",
+            f"  VoxCPM2 模型：{'✅ 已載入' if voxcpm_loaded else '⏸️ 未載入'}",
+            f"  Edge TTS：永遠可用（fallback）",
+            "",
+            "可用指令：`!engine indextts` / `!engine voxcpm` / `!engine edge`",
+        ]
+        try:
+            import torch
+            if torch.cuda.is_available():
+                vram = round(torch.cuda.memory_allocated() / (1024**3), 2)
+                lines.insert(2, f"  VRAM 佔用：{vram} GB")
+        except Exception:
+            pass
+        await ctx.send("\n".join(lines))
+        return
+
+    engine_name = engine_name.strip().lower()
+
+    if engine_name not in ("indextts", "voxcpm", "edge"):
+        await ctx.send("❌ 可用引擎：`indextts` / `voxcpm` / `edge`")
+        return
+
+    with _engine_switch_lock:
+        if engine_name == _current_engine:
+            await ctx.send(f"ℹ️ 已經是 `{_current_engine}` 引擎")
+            return
+
+        status_msg = await ctx.send(f"🔄 切換引擎中：`{_current_engine}` → `{engine_name}` …")
+
+        try:
+            if engine_name == "indextts":
+                # 卸載 VoxCPM
+                _unload_voxcpm()
+                # 確保 Docker 運行
+                r = await asyncio.get_running_loop().run_in_executor(
+                    None, indextts2_client.ensure_running, 300
+                )
+                if not r.get("ok"):
+                    await status_msg.edit(content=f"❌ IndexTTS2 啟動失敗：{r.get('reason', '?')}\n維持 `{_current_engine}` 引擎")
+                    return
+                _current_engine = "indextts"
+
+            elif engine_name == "voxcpm":
+                # 停 Docker 釋放 VRAM
+                await ctx.send("⏳ 停止 IndexTTS2 Docker…（需等待一分鐘）")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, indextts2_client.stop
+                )
+                await asyncio.sleep(2)  # 等 Docker 完全釋放 VRAM
+                # 載入 VoxCPM
+                await ctx.send("⏳ 載入 VoxCPM2 模型…")
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _engine.load_model
+                )
+                _current_engine = "voxcpm"
+
+            elif engine_name == "edge":
+                _unload_voxcpm()
+                indextts2_client.stop()
+                await asyncio.sleep(1)
+                _current_engine = "edge"
+
+            await status_msg.edit(
+                content=f"✅ 引擎已切換為 `{_current_engine}`"
+            )
+            print(f"[engine] 引擎切換：{_current_engine}")
+
+        except Exception as e:
+            await ctx.send(f"❌ 切換失敗：{e}\n維持 `{_current_engine}` 引擎")
+            print(f"[engine] 切換失敗: {e}")
+
+
+# ---------------------------------------------------------------------------
+# !drama — 多人廣播劇
+# ---------------------------------------------------------------------------
 
 @bot.command(name="drama")
 async def cmd_drama(ctx, *, args: str = ""):
@@ -2377,7 +2599,7 @@ def _render_weekly_audio(report_text: str, output_wav: str, source_path: str) ->
     with tempfile.TemporaryDirectory(prefix="wangdom_weekly_") as td:
         for i, seg in enumerate(segments):
             seg_path = Path(td) / f"weekly_{i:04d}.wav"
-            res = _engine.synthesize_file(
+            res = _synth_with_fallback(
                 text=seg["text"],
                 character=seg["speaker"],
                 output_path=seg_path,
@@ -2616,6 +2838,8 @@ async def _api_health(_request):
     """GET /status — Bot 全域健康"""
     return aioweb.json_response({
         "ok": True,
+        "engine": _current_engine,
+        "indextts2_healthy": indextts2_client.healthcheck(),
         "model_loaded": _engine.model_loaded,
         "busy": _engine.busy,
         "queue": _engine.queue_snapshot(),
@@ -2735,7 +2959,7 @@ async def _api_say(request):
 
     result = await asyncio.get_running_loop().run_in_executor(
         None,
-        lambda: _engine.synthesize_file(
+        lambda: _synth_with_fallback(
             text=text, character=character, output_path=out_path,
             mood=mood, ambience=ambience, output_format="mp3",
         ),
@@ -3214,9 +3438,9 @@ def main():
         print("❌ 請設定 VOICE_BOT_TOKEN（.env 或環境變數）")
         sys.exit(1)
 
-    print("🚀 崴勝王朝語音 Bot 啟動中...")
-    print("📦 預先載入 VoxCPM 模型（常駐）...")
-    _engine.load_model()
+    print("🚀 鼎勝王朝語音 Bot 啟動中...")
+    print("📦 雙引擎模式：IndexTTS2（預設）/ VoxCPM2 / Edge TTS")
+    print("💡 模型按需載入，啟動時零 VRAM")
     bot.run(token)
 
 
