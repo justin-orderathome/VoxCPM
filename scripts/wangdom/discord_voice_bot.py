@@ -154,7 +154,12 @@ def _strip_leading_emoji(text: str) -> str:
             break
     return text[i:].strip()
 
-DRAMA_VAULT_ROOT = Path(os.environ.get("VAULT_PATH", str(Path.home() / "projects" / "second-brain-clerk"))) / "wiki" / "鼎勝王朝" / "趣聞閣"
+_VAULT_BASE = Path(os.environ.get("VAULT_PATH", str(Path.home() / "projects" / "second-brain-clerk"))) / "wiki" / "鼎勝王朝"
+DRAMA_VAULT_ROOTS = [
+    _VAULT_BASE / "趣聞閣",
+    _VAULT_BASE / "講堂閣",
+]
+DRAMA_VAULT_ROOT = DRAMA_VAULT_ROOTS[0]  # 向後相容
 SPEAKER_ALIAS = {
     "主公": "主公·劉邦",
     "諸葛亮": "軍師·諸葛亮",
@@ -184,23 +189,27 @@ def _resolve_drama_script_input(script_arg: str) -> tuple[Optional[Path], str]:
 
     is_folder_hint = ("/" not in raw and "\\" not in raw)
     if is_folder_hint:
-        folder = DRAMA_VAULT_ROOT / raw
-        if not folder.exists() or not folder.is_dir():
-            candidates = [p.name for p in DRAMA_VAULT_ROOT.iterdir() if p.is_dir()] if DRAMA_VAULT_ROOT.exists() else []
-            guessed = difflib.get_close_matches(raw, candidates, n=3, cutoff=0.3)
-            hint = f"；你是不是想輸入：{', '.join(guessed)}" if guessed else ""
-            return None, f"查無館藏資料夾：{raw}{hint}"
+        for vault_root in DRAMA_VAULT_ROOTS:
+            folder = vault_root / raw
+            if not folder.exists() or not folder.is_dir():
+                continue
+            json_path = folder / "語音版.json"
+            if json_path.exists():
+                return json_path, ""
+            # 檢查導演劇本.md 是否存在，供 caller 自動生成
+            md_path = folder / "導演劇本.md"
+            if md_path.exists():
+                return None, f"__AUTO_COMPILE__:{folder}"
+            return None, f"資料夾缺少語音版.json：{folder}（亦無導演劇本.md 可供自動生成）"
 
-        json_path = folder / "語音版.json"
-        if json_path.exists():
-            return json_path, ""
-
-        # 檢查導演劇本.md 是否存在，供 caller 自動生成
-        md_path = folder / "導演劇本.md"
-        if md_path.exists():
-            return None, f"__AUTO_COMPILE__:{folder}"
-
-        return None, f"資料夾缺少語音版.json：{folder}（亦無導演劇本.md 可供自動生成）"
+        # 所有閣都找不到 → fuzzy match 合併所有閣的候選
+        all_candidates = []
+        for vault_root in DRAMA_VAULT_ROOTS:
+            if vault_root.exists():
+                all_candidates.extend(p.name for p in vault_root.iterdir() if p.is_dir())
+        guessed = difflib.get_close_matches(raw, all_candidates, n=3, cutoff=0.3)
+        hint = f"；你是不是想輸入：{', '.join(guessed)}" if guessed else ""
+        return None, f"查無館藏資料夾：{raw}{hint}"
 
     return None, f"劇本檔案不存在：{raw}"
 
