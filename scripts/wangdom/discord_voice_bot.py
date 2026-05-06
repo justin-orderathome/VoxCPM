@@ -60,6 +60,7 @@ from audio_post import post_process
 from director_parser import parse_director_script, save_voice_json
 import director_parser as _dp
 import indextts2_client
+import voxcpm2_client
 
 
 
@@ -345,65 +346,39 @@ class StreamAmbience:
 
 
 # ---------------------------------------------------------------------------
-# 常駐 VoxCPM 引擎
+# VoxCPM2 引擎（HTTP Client 模式 — 零 VRAM 駐留）
+# ---------------------------------------------------------------------------
+# 模型載入/合成全部委託 voxcpm2_server.py（獨立 subprocess，port 8008）
+# Voice Bot 本身不直接 import voxcpm，啟動後 VRAM 佔用 ≈ 0
 # ---------------------------------------------------------------------------
 class VoxCpmEngine:
     def __init__(self, profiles_path: str | Path, model_id: str = "openbmb/VoxCPM2"):
         self.model_id = model_id
         self.profile_manager = VoiceProfileManager(profiles_path)
-        self._model = None
-        self._gpu_lock = threading.Lock()
-        self._stats_lock = threading.Lock()
-        self._waiting_jobs = 0
-        self._active_job: Optional[str] = None
+        # 不再有 _model / _gpu_lock — 全部由 HTTP server 管理
 
     @property
     def model_loaded(self) -> bool:
-        return self._model is not None
+        """查詢 VoxCPM2 server 模型狀態。"""
+        status = voxcpm2_client.get_status()
+        return status.get("model_loaded", False)
 
     @property
     def busy(self) -> bool:
-        return self._gpu_lock.locked()
+        status = voxcpm2_client.get_status()
+        return status.get("busy", False)
 
     def queue_snapshot(self) -> dict:
-        with self._stats_lock:
-            return {
-                "busy": self._gpu_lock.locked(),
-                "waiting": self._waiting_jobs,
-                "active_job": self._active_job,
-            }
-
-    def _acquire_gpu(self, job_label: str):
-        with self._stats_lock:
-            self._waiting_jobs += 1
-        self._gpu_lock.acquire()
-        with self._stats_lock:
-            self._waiting_jobs = max(0, self._waiting_jobs - 1)
-            self._active_job = job_label
-
-    def _release_gpu(self):
-        with self._stats_lock:
-            self._active_job = None
-        if self._gpu_lock.locked():
-            self._gpu_lock.release()
+        return voxcpm2_client.get_status()
 
     @property
     def out_sample_rate(self) -> int:
-        if self._model is None:
-            return 48000
-        tts = self._model.tts_model
-        return int(getattr(getattr(tts, "audio_vae", None), "out_sample_rate", getattr(tts, "sample_rate", 48000)))
+        return 48000  # client 端一律 resample 到 48kHz
 
     def load_model(self) -> None:
-        if self._model is not None:
-            return
-        from voxcpm import VoxCPM  # lazy import
-
-        t0 = time.time()
-        # optimize=False：避免多線程串流下 CUDA graph assertion
-        self._model = VoxCPM.from_pretrained(self.model_id, load_denoiser=False, optimize=False)
-        dt = time.time() - t0
-        print(f"✅ VoxCPM 模型已載入（{dt:.1f}s）, out_sample_rate={self.out_sample_rate}Hz")
+        """確保 VoxCPM2 server 就緒且模型已載入。"""
+        voxcpm2_client.ensure_running(timeout=300)
+        voxcpm2_client._api_post("/load", {})
 
     def _resolve_reference(self, ref: Optional[str]) -> Optional[str]:
         if not ref:
@@ -473,70 +448,23 @@ class VoxCpmEngine:
         ambience: str = "none",
         output_format: str = "mp3",
     ) -> dict:
-        self.load_model()
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._acquire_gpu(f"file:{character}")
-        try:
-            kwargs = self._build_kwargs(text, character, mood, expression_tags)
-            wav = self._model.generate(**kwargs)
-            arr = wav.cpu().numpy() if hasattr(wav, "cpu") else wav
-            arr = np.asarray(arr, dtype=np.float32)
-            if arr.ndim == 2:
-                arr = arr.squeeze(0)
-            arr = normalize_rms(arr, target_rms=0.08)
-
-            sr = self.out_sample_rate
-            wav_path = output_path if output_path.suffix.lower() == ".wav" else output_path.with_suffix(".wav")
-            sf.write(str(wav_path), arr, sr)
-
-            final_path = wav_path
-            if ambience and ambience != "none":
-                post_path = wav_path.with_name(f"{wav_path.stem}.post.wav")
-                post_process(wav_path, post_path, ambience_profile=ambience, normalize=0.08)
-                wav_path.unlink(missing_ok=True)
-                final_path = post_path
-
-            if output_format == "mp3":
-                mp3_path = output_path if output_path.suffix.lower() == ".mp3" else output_path.with_suffix(".mp3")
-                cmd = [
-                    "ffmpeg", "-y", "-i", str(final_path),
-                    "-codec:a", "libmp3lame", "-b:a", "128k",
-                    str(mp3_path),
-                ]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-                if r.returncode != 0:
-                    return {
-                        "ok": False,
-                        "reason": f"ffmpeg 轉 MP3 失敗: {r.stderr[:300]}",
-                        "output_path": str(final_path),
-                        "format": "wav",
-                    }
-                final_path.unlink(missing_ok=True)
-                final_path = mp3_path
-
-            return {
-                "ok": True,
-                "engine": "voxcpm",
-                "output_path": str(final_path),
-                "format": output_format,
-                "sample_rate": sr,
-                "character": character,
-            }
-        except Exception as e:
-            # 檔案模式自動 fallback 到 edge_tts，避免失聲
-            edge_out = output_path if output_path.suffix.lower() == ".mp3" else output_path.with_suffix(".mp3")
-            edge = self.synthesize_with_edge(text=text, character=character, output_path=edge_out)
-            if edge.get("ok"):
-                edge["fallback_from"] = f"voxcpm_error: {e}"
-                return edge
-            return {
-                "ok": False,
-                "reason": f"voxcpm_failed_and_edge_failed: {e}; {edge.get('reason', 'unknown')}",
-            }
-        finally:
-            self._release_gpu()
+        # 委託 HTTP client — 包含 ensure_running、profile 解析、style compile、
+        # synthesize、resample、normalize、ambience、ffmpeg MP3 全部邏輯
+        result = voxcpm2_client.synthesize(
+            text=text,
+            character=character,
+            output_path=output_path,
+            mood=mood,
+            expression_tags=expression_tags,
+            ambience=ambience,
+            output_format=output_format,
+            profile_manager=self.profile_manager,
+            style_compiler_func=compile_text,
+        )
+        return result
 
     def stream_chunks(
         self,
@@ -547,37 +475,78 @@ class VoxCpmEngine:
         stop_event: Optional[threading.Event] = None,
         ambience: str = "none",
     ):
-        """yield float32 mono chunks（crossfade 去邊界 click/pop + 即時 ambience）。"""
-        self.load_model()
+        """yield float32 mono chunks（HTTP 模式：先合成完整音頻再本地分塊）。"""
+        import threading as _threading
 
-        self._acquire_gpu(f"stream:{character}")
-        try:
-            kwargs = self._build_kwargs(text, character, mood, expression_tags)
-            sr = self.out_sample_rate
-            overlap = max(1, int(sr * 0.006))  # 6ms
-            ambience_fx = StreamAmbience(ambience, sr)
+        # 1. 透過 HTTP 合成完整音頻
+        tmp_wav = Path(tempfile.gettempdir()) / f"vox_stream_{os.getpid()}_{int(time.time()*1000)}.wav"
+        result = voxcpm2_client.synthesize(
+            text=text,
+            character=character,
+            output_path=tmp_wav,
+            mood=mood,
+            expression_tags=expression_tags,
+            output_format="wav",
+            profile_manager=self.profile_manager,
+            style_compiler_func=compile_text,
+        )
 
-            prev: Optional[np.ndarray] = None
-            for chunk in self._model.generate_streaming(**kwargs):
-                if stop_event and stop_event.is_set():
-                    break
-                c = np.asarray(chunk, dtype=np.float32).reshape(-1)
-                c = ambience_fx.process(c)
-                c = normalize_rms(c, target_rms=0.08)
+        if not result.get("ok"):
+            # fallback 到 edge_tts
+            edge_result = self.synthesize_with_edge(
+                text=text, character=character, output_path=tmp_wav.with_suffix(".mp3")
+            )
+            if not edge_result.get("ok"):
+                return  # 無法合成
+            audio, sr = sf.read(str(edge_result["output_path"]), dtype="float32")
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
+            try:
+                Path(edge_result["output_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        else:
+            audio, sr = sf.read(str(tmp_wav), dtype="float32")
+            if audio.ndim == 2:
+                audio = audio.mean(axis=1)
+            try:
+                tmp_wav.unlink(missing_ok=True)
+            except Exception:
+                pass
 
-                if prev is None:
-                    prev = c
-                    continue
+        # 2. Resample → 48kHz
+        if sr != 48000:
+            audio = _resample_audio(audio, sr, 48000)
+            sr = 48000
 
-                out, tail = crossfade_chunks(prev, c, overlap)
-                if out.size:
-                    yield out
-                prev = tail if tail.size else None
+        # 3. Ambience
+        ambience_fx = StreamAmbience(ambience, sr)
+        audio = ambience_fx.process(audio)
 
-            if prev is not None and prev.size and not (stop_event and stop_event.is_set()):
-                yield prev
-        finally:
-            self._release_gpu()
+        # 4. 分塊 yield（0.5s chunks + crossfade）
+        overlap = max(1, int(sr * 0.006))  # 6ms
+        chunk_size = int(sr * 0.5)  # 0.5s
+        prev: Optional[np.ndarray] = None
+
+        for i in range(0, len(audio), chunk_size):
+            if stop_event and stop_event.is_set():
+                break
+            c = audio[i:i+chunk_size]
+            c = normalize_rms(c, target_rms=0.08)
+
+            if prev is None:
+                prev = c
+                continue
+
+            out, tail = crossfade_chunks(prev, c, overlap)
+            if out.size:
+                yield out
+            prev = tail if tail.size else None
+
+        if prev is not None and prev.size and not (stop_event and stop_event.is_set()):
+            yield prev
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -733,31 +702,19 @@ def _ensure_engine_ready() -> bool:
         r = indextts2_client.ensure_running(timeout=180)
         return r.get("ok", False)
     elif _current_engine == "voxcpm":
-        try:
-            _engine.load_model()
-            return True
-        except Exception as e:
-            print(f"[engine] ⚠️ VoxCPM2 載入失敗: {e}")
+        r = voxcpm2_client.ensure_running(timeout=300)
+        if not r.get("ok"):
+            print(f"[engine] ⚠️ VoxCPM2 server 未就緒: {r.get('reason')}")
             return False
+        return True
     else:  # edge — 永遠就緒
         return True
 
 
 def _unload_voxcpm():
-    """卸載 VoxCPM2 模型釋放 VRAM。"""
-    if _engine.model_loaded:
-        try:
-            del _engine._model
-        except Exception:
-            pass
-        _engine._model = None
-        try:
-            import gc, torch
-            gc.collect()
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
-        print("[engine] VoxCPM2 模型已卸載，VRAM 已釋放")
+    """卸載 VoxCPM2 模型釋放 VRAM（透過 HTTP API）。"""
+    voxcpm2_client.unload()
+    print("[engine] VoxCPM2 模型已卸載（HTTP），VRAM 已釋放")
 
 
 # ---------------------------------------------------------------------------
@@ -1649,7 +1606,7 @@ async def _synthesize_and_play_stream(
                 ):
                     if stop_event and stop_event.is_set():
                         break
-                    pcm = mono_float_to_pcm_s16le_stereo(chunk, sample_rate=_engine.out_sample_rate)
+                    pcm = mono_float_to_pcm_s16le_stereo(chunk, sample_rate=48000)
                     source.put_data(pcm)
             else:  # edge — 不支援串流，fallback 檔案模式
                 raise RuntimeError("Edge TTS 不支援串流模式，請用檔案模式")
@@ -2236,12 +2193,15 @@ async def cmd_engine(ctx, engine_name: str = ""):
     if not engine_name.strip():
         # 查詢狀態
         indextts_ok = indextts2_client.healthcheck()
-        voxcpm_loaded = _engine.model_loaded
+        voxcpm_status = voxcpm2_client.get_status()
+        voxcpm_loaded = voxcpm_status.get("model_loaded", False)
+        voxcpm_running = voxcpm_status.get("status") == "ok" or voxcpm2_client.healthcheck()
         lines = [
             f"🔧 **當前引擎：`{_current_engine}`**",
             "",
             f"  IndexTTS2 Docker：{'✅ 運行中' if indextts_ok else '❌ 未啟動'}",
-            f"  VoxCPM2 模型：{'✅ 已載入' if voxcpm_loaded else '⏸️ 未載入'}",
+            f"  VoxCPM2 Server：{'✅ 運行中' if voxcpm_running else '❌ 未啟動'}",
+            f"  VoxCPM2 模型：{'✅ 已載入' if voxcpm_loaded else '⏸️ 未載入（lazy）'}",
             f"  Edge TTS：永遠可用（fallback）",
             "",
             "可用指令：`!engine indextts` / `!engine voxcpm` / `!engine edge`",
@@ -2271,8 +2231,9 @@ async def cmd_engine(ctx, engine_name: str = ""):
 
         try:
             if engine_name == "indextts":
-                # 卸載 VoxCPM
+                # 卸載 VoxCPM 並停止 server
                 _unload_voxcpm()
+                voxcpm2_client.stop()
                 # 確保 Docker 運行
                 r = await asyncio.get_running_loop().run_in_executor(
                     None, indextts2_client.ensure_running, 300
@@ -2289,15 +2250,19 @@ async def cmd_engine(ctx, engine_name: str = ""):
                     None, indextts2_client.stop
                 )
                 await asyncio.sleep(2)  # 等 Docker 完全釋放 VRAM
-                # 載入 VoxCPM
-                await ctx.send("⏳ 載入 VoxCPM2 模型…")
-                await asyncio.get_running_loop().run_in_executor(
-                    None, _engine.load_model
+                # 啟動 VoxCPM2 HTTP server + 載入模型
+                await ctx.send("⏳ 啟動 VoxCPM2 server 並載入模型…")
+                r = await asyncio.get_running_loop().run_in_executor(
+                    None, voxcpm2_client.ensure_running, 300
                 )
+                if not r.get("ok"):
+                    await status_msg.edit(content=f"❌ VoxCPM2 啟動失敗：{r.get('reason', '?')}\n維持 `{_current_engine}` 引擎")
+                    return
                 _current_engine = "voxcpm"
 
             elif engine_name == "edge":
                 _unload_voxcpm()
+                voxcpm2_client.stop()  # 停止 VoxCPM2 server subprocess
                 indextts2_client.stop()
                 await asyncio.sleep(1)
                 _current_engine = "edge"
