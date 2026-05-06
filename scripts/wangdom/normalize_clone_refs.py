@@ -12,7 +12,8 @@ import soundfile as sf
 import numpy as np
 import os, glob, argparse, json, shutil
 
-REF_DIR = "/home/hermes01/projects/VoxCPM/test_output/voice_profiles/clone_refs"
+_PROJECT_ROOT = os.environ.get("VOXCPM_PATH", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+REF_DIR = os.path.join(_PROJECT_ROOT, "test_output", "voice_profiles", "clone_refs")
 DEFAULT_TARGET_RMS = 0.04
 
 

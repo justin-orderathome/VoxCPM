@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 SERVICE_NAME = "voice-bot.service"
-PROJECT_ROOT = Path("/home/hermes01/projects/VoxCPM")
+PROJECT_ROOT = Path(os.environ.get("VOXCPM_PATH", str(Path(__file__).resolve().parent.parent.parent)))
 LOG_PATH = PROJECT_ROOT / "output" / "voice-bot-healthcheck.log"
 HEARTBEAT_PATH = PROJECT_ROOT / "output" / "voice-bot-heartbeat.json"
 HEARTBEAT_STALE_SECONDS = 120  # heartbeat older than 2 min = stale
