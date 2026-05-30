@@ -1526,12 +1526,19 @@ async def _ensure_voice_client(ctx, preferred_voice_channel_id: Optional[int] = 
             target_channel = author.voice.channel
 
     if target_channel is None:
+        author = getattr(ctx, "author", None)
+        has_voice = bool(author and getattr(author, "voice", None) and author.voice.channel)
+        print(f"[ensure_voice] ⚠️ 無目標語音頻道 (preferred={preferred_voice_channel_id}, author_voice={has_voice})")
         return None
 
     if vc is None:
+        print(f"[ensure_voice] 連接到語音頻道：{target_channel.name} ({target_channel.id})")
         vc = await target_channel.connect()
     elif vc.channel != target_channel:
+        print(f"[ensure_voice] 移動到語音頻道：{target_channel.name} ({target_channel.id})")
         await vc.move_to(target_channel)
+
+    print(f"[ensure_voice] ✅ vc ready, connected={vc.is_connected()}, channel={vc.channel.name if vc.channel else 'None'}")
     return vc
 
 
@@ -1818,10 +1825,16 @@ async def cmd_say(ctx, *, args: str = ""):
     mode = _router.resolve(ctx, flag_file=parsed["file"], flag_stream=parsed["stream"])
 
     if mode == OutputMode.STREAM:
-        await _synthesize_and_play_stream(
+        stream_ok = await _synthesize_and_play_stream(
             ctx, character, text,
             mood=parsed["mood"], ambience=parsed["ambience"],
         )
+        if not stream_ok:
+            await ctx.send("⚠️ 語音串流失敗，自動改為檔案模式…")
+            await _synthesize_and_send_file(
+                ctx, character, text,
+                mood=parsed["mood"], ambience=parsed["ambience"],
+            )
     else:
         await _synthesize_and_send_file(
             ctx, character, text,
@@ -1848,18 +1861,29 @@ async def cmd_play(ctx, *, args: str = ""):
     mode = _router.resolve(ctx, flag_file=flag_file, flag_stream=flag_stream)
 
     if mode == OutputMode.STREAM:
-        vc = await _ensure_voice_client(ctx)
-        if vc is None:
-            await ctx.send("⚠️ 主公不在語音頻道，請先加入或使用 `-f`")
-            return
-
-        # 用 FFmpegPCMAudio 直接播既有音檔
-        source = discord.FFmpegPCMAudio(
-            str(file_path),
-            options="-vn -f s16le -ar 48000 -ac 2",
-        )
-        vc.play(source)
-        await ctx.send(f"🔊 正在播放：`{Path(file_path).name}`")
+        try:
+            vc = await _ensure_voice_client(ctx)
+            if vc is None:
+                raise RuntimeError("語音頻道不可用")
+            if vc.is_playing():
+                vc.stop()
+            # 用 FFmpegPCMAudio 直接播既有音檔
+            source = discord.FFmpegPCMAudio(
+                str(file_path),
+                options="-vn -f s16le -ar 48000 -ac 2",
+            )
+            vc.play(source)
+            await ctx.send(f"🔊 正在播放：`{Path(file_path).name}`")
+        except Exception as e:
+            print(f"[play] ⚠️ 語音串流失敗，自動 fallback：{e}")
+            try:
+                if ctx.voice_client:
+                    await ctx.voice_client.disconnect()
+            except Exception:
+                pass
+            await ctx.send(f"⚠️ 語音串流失敗，自動改為檔案上傳")
+            audio_file = discord.File(file_path, filename=Path(file_path).name)
+            await ctx.send(f"📎 語音檔案：`{Path(file_path).name}`（語音串流失敗，自動 fallback）", file=audio_file)
     else:
         audio_file = discord.File(file_path, filename=Path(file_path).name)
         await ctx.send(f"📎 語音檔案：`{Path(file_path).name}`", file=audio_file)
@@ -2440,39 +2464,82 @@ async def cmd_drama(ctx, *, args: str = ""):
         fallback_voice_profile = result.get("fallback_voice_profile", "待詔·唐伯虎")
 
         if mode == OutputMode.STREAM:
-            vc = await _ensure_voice_client(ctx)
-            if vc is None:
-                await status_msg.edit(content="⚠️ 主公不在語音頻道，請先加入或改用 `-f`")
-                return
-
-            if vc.is_playing():
-                vc.stop()
-
-            source = discord.FFmpegPCMAudio(
-                str(drama_wav),
-                options="-vn -f s16le -ar 48000 -ac 2",
-            )
-            vc.play(source)
-            await status_msg.edit(content="🔊 廣播劇已開始播放")
-            await ctx.send(summary)
-            if fallback_segments > 0:
-                await ctx.send(
-                    f"⚠️ 角色 fallback：{fallback_segments} 段使用 `{fallback_voice_profile}` 聲線（原角色：{', '.join(fallback_speakers)}）"
+            vc = None
+            voice_ok = False
+            try:
+                vc = await _ensure_voice_client(ctx)
+                if vc is None:
+                    raise RuntimeError("找不到語音頻道")
+                if vc.is_playing():
+                    vc.stop()
+                # 編譯耗時可能數分鐘，vc 可能已斷開。健康檢查 + 重連。
+                if vc.is_connected() is False:
+                    print("[drama] vc 已斷開，重新連接...")
+                    try:
+                        await vc.disconnect()
+                    except Exception:
+                        pass
+                    vc = await _ensure_voice_client(ctx)
+                    if vc is None or vc.is_connected() is False:
+                        raise RuntimeError("語音連線已斷開且無法重連")
+                source = discord.FFmpegPCMAudio(
+                    str(drama_wav),
+                    options="-vn -f s16le -ar 48000 -ac 2",
                 )
-            if transcript_timeline:
-                await ctx.send("📝 **廣播劇文字同步（逐句）**")
-                first = transcript_timeline[0]
-                await ctx.send(_fmt_line(first['text'], first['speaker']))
-                if len(transcript_timeline) > 1:
-                    shifted = []
-                    base = float(transcript_timeline[1].get("start_sec", 0.0))
-                    for row in transcript_timeline[1:]:
-                        shifted.append({
-                            "speaker": row["speaker"],
-                            "text": row["text"],
-                            "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
-                        })
-                    asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+                vc.play(source)
+                await status_msg.edit(content="🔊 廣播劇已開始播放")
+                await ctx.send(summary)
+                if fallback_segments > 0:
+                    await ctx.send(
+                        f"⚠️ 角色 fallback：{fallback_segments} 段使用 `{fallback_voice_profile}` 聲線（原角色：{', '.join(fallback_speakers)}）"
+                    )
+                if transcript_timeline:
+                    await ctx.send("📝 **廣播劇文字同步（逐句）**")
+                    first = transcript_timeline[0]
+                    await ctx.send(_fmt_line(first['text'], first['speaker']))
+                    if len(transcript_timeline) > 1:
+                        shifted = []
+                        base = float(transcript_timeline[1].get("start_sec", 0.0))
+                        for row in transcript_timeline[1:]:
+                            shifted.append({
+                                "speaker": row["speaker"],
+                                "text": row["text"],
+                                "start_sec": max(0.0, float(row.get("start_sec", 0.0)) - base),
+                            })
+                        asyncio.create_task(_send_drama_transcript_timed(ctx, shifted))
+                voice_ok = True
+            except Exception as ve:
+                print(f"[drama] ⚠️ 語音串流失敗，自動 fallback 到檔案模式：{ve}")
+                # 嘗試斷開失敗的 vc
+                try:
+                    if vc and not vc.is_connected():
+                        await vc.disconnect()
+                except Exception:
+                    pass
+
+            # ── 語音串流失敗時，自動 fallback 為檔案上傳 ──
+            if not voice_ok:
+                await status_msg.edit(content="⚠️ 語音串流失敗，自動轉為檔案上傳…")
+                drama_mp3 = OUTPUT_DIR / f"drama_{ts}.mp3"
+                ok, err = await asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: _convert_wav_to_mp3(str(drama_wav), str(drama_mp3)),
+                )
+                if ok:
+                    await status_msg.edit(content="✅ 廣播劇已生成（檔案模式）")
+                    await ctx.send(summary)
+                    if fallback_segments > 0:
+                        await ctx.send(
+                            f"⚠️ 角色 fallback：{fallback_segments} 段使用 `{fallback_voice_profile}` 聲線（原角色：{', '.join(fallback_speakers)}）"
+                        )
+                    for chunk in transcript_chunks:
+                        await ctx.send(chunk)
+                    await ctx.send(
+                        "📎 廣播劇語音檔（語音串流失敗，自動 fallback 檔案模式）",
+                        file=discord.File(str(drama_mp3), filename=drama_mp3.name),
+                    )
+                else:
+                    await status_msg.edit(content=f"❌ 語音串流失敗且 MP3 轉檔也失敗：{err}")
         else:
             drama_mp3 = OUTPUT_DIR / f"drama_{ts}.mp3"
             ok, err = await asyncio.get_running_loop().run_in_executor(
